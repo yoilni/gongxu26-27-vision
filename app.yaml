@@ -1,0 +1,17 @@
+id: r2
+name: gongxunV925
+version: 1.0.9
+author: '1'
+icon: ''
+desc: '1'
+files:
+  - app_config.py
+  - code_scanner.py
+  - detection_verifier.py
+  - main.py
+  - media_control.py
+  - menu_ui.py
+  - performance_debug.py
+  - serial_controller.py
+  - target_selector.py
+  - vision_overlay.py
