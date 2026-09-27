@@ -39,8 +39,11 @@ COMMAND_FRAME_LENGTH = 5
 CMD_SORT = 0x02
 CMD_SEARCH = 0x03
 CMD_TRACK = 0x04
+CMD_SEARCH_SWEEP_DONE = 0x13
+CMD_ZONE_OBSTACLE_DONE = 0x36
 CMD_TRACK_CENTER_DONE = 0x14
 CMD_ARRANGE_FIRST_DONE = 0x12
+CMD_ARRANGE_LEFT_DONE = 0x22
 CMD_ARRANGE_SECOND_DONE = 0x24
 CMD_RECHECK_SORT = 0xA5
 
@@ -51,6 +54,7 @@ MODE_SEARCH_ZONE = 0x06
 MODE_WAIT_14_HANDSHAKE = 0x114
 MODE_ARRANGE_RIGHTMOST = 0x102
 MODE_ARRANGE_LEFTMOST = 0x112
+MODE_POST_ARRANGE_CHECK = 0x122
 MODE_FINAL_ROI_TRACK = 0x24
 CMD_SEARCH_RED_ZONE = 0x15
 CMD_SEARCH_BLUE_ZONE = 0x25
@@ -62,7 +66,7 @@ MODE_COMMANDS = {
     CMD_RECHECK_SORT: "RECHECK_SORT",
 }
 
-# Persistent class-selection commands. Send one, then send the required mode.
+# Persistent class-selection commands. Black selection starts state 24 directly.
 CMD_SELECT_BLUE_OBJECT = 0x01
 CMD_SELECT_RED_OBJECT = 0x11
 CMD_SELECT_GREEN_OBJECT = 0x21
@@ -90,15 +94,19 @@ EVENT_TARGET_READY = 0x05
 EVENT_ZONE_SEARCH_STARTED = 0x06
 EVENT_ZONE_FOUND = 0x16
 EVENT_ZONE_CLOSE = 0x26
+EVENT_ZONE_OBSTACLE = 0x36
+EVENT_SWITCH_TO_RED_TARGET = 0x11
 EVENT_ZONE_APPROACH = 0x07
 EVENT_SINGLE_GREEN = 0xB5
 EVENT_MULTI_GREEN = 0xC5
 EVENT_NO_TASK_TARGET = 0xD5
 EVENT_ARRANGEMENT_NO_OBJECT = 0xE2
+EVENT_SEARCH_NO_TARGET = 0xE3
 EVENT_UNCERTAIN = 0xE5
 EVENT_NO_TARGET = 0xEE
 
 EVENT_NAMES = {
+    EVENT_SWITCH_TO_RED_TARGET: "SWITCH_TO_RED_CASUALTY",
     EVENT_ROI_READY: "ROI_READY_OR_ADJUST",
     EVENT_SEARCH_CENTER_REACHED: "SEARCH_CENTER_REACHED",
     EVENT_TARGET_READY: "NEAR_VIEW_READY",
@@ -108,12 +116,14 @@ EVENT_NAMES = {
     EVENT_ZONE_FOUND: "ZONE_FOUND",
     EVENT_SKIP_TO_FINAL_TRACK: "SKIP_TO_FINAL_TRACK",
     EVENT_ZONE_CLOSE: "ZONE_CLOSE",
+    EVENT_ZONE_OBSTACLE: "ZONE_OBSTACLE_WAIT_ACK",
     EVENT_FINAL_TARGET_IN_ROI: "FINAL_TARGET_IN_ROI",
     EVENT_ZONE_APPROACH: "ZONE_APPROACH",
     EVENT_SINGLE_GREEN: "SINGLE_GREEN",
     EVENT_MULTI_GREEN: "MULTI_GREEN",
     EVENT_NO_TASK_TARGET: "NO_TASK_TARGET",
     EVENT_ARRANGEMENT_NO_OBJECT: "ARRANGE_NO_OBJECT",
+    EVENT_SEARCH_NO_TARGET: "SEARCH_NO_TARGET",
     EVENT_UNCERTAIN: "UNCERTAIN",
     EVENT_NO_TARGET: "NO_TARGET",
 }
@@ -209,6 +219,10 @@ class VisionSerialController:
         self._latest_packet = None
         self._latest_submit_ms = 0
         self._last_no_target_ms = 0
+        self._last_search_no_target_ms = 0
+        self._search_no_target_frames = 0
+        self._search_no_target_initial_sent = False
+        self._search_no_target_acknowledged = False
         self._last_arrangement_no_object_ms = 0
         self._roi_entry_sent = False
         self._track_center_sent = False
@@ -220,15 +234,23 @@ class VisionSerialController:
         self._initial_arrangement_decision_pending = False
         self._pre_02_decision_started_ms = 0
         self._arrangement_02_ack_pending = False
+        self._arrangement_02_without_side = False
         self._arrangement_side_target_available = False
         self._last_arrangement_02_event_ms = 0
         self._zone_found_sent = False
         self._zone_close_sent = False
+        self._zone_obstacle_waiting = False
+        self._zone_obstacle_armed = True
+        self._zone_obstacle_frames = 0
+        self._zone_obstacle_clear_frames = 0
+        self._last_zone_obstacle_event_ms = 0
         self._near_view_started_ms = 0
         self._near_view_adjust_sent = False
         self._near_view_result_sent = False
         self._near_view_stable_bucket = None
         self._near_view_stable_frames = 0
+        self._first_green_near_view_decided = False
+        self._first_green_both_sides_required = False
         self._last_target_center_x = None
         self._last_target_center_y = None
         self._last_target_area = None
@@ -275,7 +297,13 @@ class VisionSerialController:
                 "middle_reacquire12_x_v1 arrange_open_loop_v1 "
                 "e2_rx24_v1 repeat34_500ms_v1 "
                 "target_cmds_01_11_21_31_v1 repeat34_while_centered_v2 "
-                "repeat02_until12_500ms_v1 pre02_timeout2500_v1"
+                "repeat02_until12_500ms_v1 pre02_timeout2500_v1 "
+                "final24_primary_spacing_v1 search03_e3_ack13_v2 "
+                "search03_missing3_v1 search03_roi_yx_v1 zone16_obstacle36_v1 "
+                "exclude_safe_zone_targets_v1 zone36_roi_out20_in10_v3 "
+                "zone_red_casualty_right625_v2 final24_fallback_max_y_v2 "
+                "near05_red_foreign_arrange_v1 near05_black_green_rules_v2 "
+                "zone36_accumulated3_v1 black_track_red_priority_v1"
             )
         except Exception as exc:
             self.enabled = False
@@ -305,7 +333,41 @@ class VisionSerialController:
     def _handle_command(self, command):
         changed = False
         description = None
+        search_no_target_ack = False
         with self._lock:
+            if (
+                command == CMD_ARRANGE_SECOND_DONE
+                and self._first_green_both_sides_required
+                and self.mode in (MODE_ARRANGE_RIGHTMOST, MODE_ARRANGE_LEFTMOST)
+            ):
+                # This first green load must complete both MCU-timed pushes.
+                # A recovery/legacy 24 must not bypass either handshake.
+                expected = "12" if self.mode == MODE_ARRANGE_RIGHTMOST else "22"
+                print("Vision UART command 0x24: first_green_both_sides wait_RX" + expected)
+                return
+            if (
+                command == CMD_ZONE_OBSTACLE_DONE
+                and self.mode == MODE_SEARCH_ZONE
+                and self._zone_obstacle_waiting
+            ):
+                self._zone_obstacle_waiting = False
+                self._zone_obstacle_armed = False
+                self._zone_obstacle_frames = 0
+                self._zone_obstacle_clear_frames = 0
+                pending_36 = build_event_packet(EVENT_ZONE_OBSTACLE)
+                self._pending_events = [
+                    event for event in self._pending_events
+                    if event != pending_36
+                ]
+                # Resume only with a new image after the MCU's maneuver.
+                self._latest_packet = None
+                self._latest_submit_ms = 0
+                self._last_target_center_x = None
+                self._last_target_center_y = None
+                self._last_target_area = None
+                self._last_target_accept_ms = 0
+                print("Vision UART command 0x36: bypass_done=resume_zone_coordinates")
+                return
             if (
                 command == CMD_TRACK_CENTER_DONE
                 and self.mode == MODE_WAIT_14_HANDSHAKE
@@ -351,14 +413,23 @@ class VisionSerialController:
                     self._middle_target_anchor = (middle_x, None, None)
                 # Do not skip merely because two boxes are visible: the second
                 # box can be another green object that still needs pushing.
-                # State 12 will send event 24 after only the locked middle
-                # object remains for the configured five consecutive frames.
+                # State 12 waits for MCU command 22 before checking whether
+                # a target satisfies the state-24 selection rules.
                 self.mode = MODE_ARRANGE_LEFTMOST
                 description = "arrange=nearest_left_to_roi_center"
                 self._arrangement_target_anchor = None
                 self._pending_events.append(
                     build_event_packet(EVENT_ARRANGE_FIRST_ACK)
                 )
+                changed = True
+            elif (
+                command == CMD_ARRANGE_LEFT_DONE
+                and self.mode in (MODE_ARRANGE_LEFTMOST, MODE_POST_ARRANGE_CHECK)
+            ):
+                self.mode = MODE_POST_ARRANGE_CHECK
+                self._first_green_both_sides_required = False
+                self._pending_events.clear()
+                description = "mode=POST_ARRANGE_CHECK wait_valid_target_before_TX24"
                 changed = True
             elif (
                 command == CMD_ARRANGE_SECOND_DONE
@@ -384,18 +455,48 @@ class VisionSerialController:
                     build_event_packet(EVENT_TARGET_READY)
                 )
                 changed = True
+            elif (
+                command == CMD_SEARCH_SWEEP_DONE
+                and self.mode == CMD_SEARCH
+            ):
+                description = "search_sweep_done=repeat_E3_if_missing"
+                search_no_target_ack = True
+                changed = True
             elif command in MODE_COMMANDS:
-                self.mode = command
-                description = "mode=" + MODE_COMMANDS[command]
+                if (
+                    self.target_label == "triangualrblack"
+                    and command in (CMD_SEARCH, CMD_TRACK)
+                ):
+                    self.mode = MODE_FINAL_ROI_TRACK
+                    self._pending_events.clear()
+                    description = "black_target=direct_FINAL_ROI_TRACK"
+                else:
+                    self.mode = command
+                    description = "mode=" + MODE_COMMANDS[command]
                 changed = True
             elif command in TARGET_SELECTION_COMMANDS:
+                self._first_green_both_sides_required = False
                 self.target_label = TARGET_SELECTION_COMMANDS[command]
                 description = "target=" + self.target_label
+                if command == CMD_SELECT_BLACK_OBJECT:
+                    self.mode = MODE_FINAL_ROI_TRACK
+                    self._pending_events.clear()
+                    description += " mode=FINAL_ROI_TRACK"
                 changed = True
             if changed:
+                self._arrangement_02_without_side = False
                 # Do not reuse data collected for the previous state/class.
                 self._latest_packet = None
                 self._latest_submit_ms = 0
+                if search_no_target_ack:
+                    self._search_no_target_initial_sent = True
+                    self._search_no_target_acknowledged = True
+                    self._last_search_no_target_ms = _now_ms()
+                else:
+                    self._last_search_no_target_ms = 0
+                    self._search_no_target_frames = 0
+                    self._search_no_target_initial_sent = False
+                    self._search_no_target_acknowledged = False
                 self._roi_entry_sent = False
                 self._track_center_sent = False
                 self._final_roi_sent = False
@@ -417,6 +518,11 @@ class VisionSerialController:
                     self._arrangement_target_anchor = None
                 self._zone_found_sent = False
                 self._zone_close_sent = False
+                self._zone_obstacle_waiting = False
+                self._zone_obstacle_armed = True
+                self._zone_obstacle_frames = 0
+                self._zone_obstacle_clear_frames = 0
+                self._last_zone_obstacle_event_ms = 0
                 self._near_view_started_ms = (
                     _now_ms() if self.mode == MODE_NEAR_VIEW_CHECK else 0
                 )
@@ -454,6 +560,50 @@ class VisionSerialController:
             )
             pre_02_decision_started_ms = self._pre_02_decision_started_ms
 
+        # Near-view load counting remains full-frame. For tracking/arrangement,
+        # material already inside a detected safety zone is not a target.
+        if mode != MODE_NEAR_VIEW_CHECK:
+            zone_detections = raw_objects if raw_objects is not None else objects
+            objects = self._exclude_objects_in_safety_zones(
+                objects, labels, zone_detections
+            )
+
+        if (
+            target_label == "triangualrblack"
+            and mode in (CMD_SEARCH, CMD_TRACK, MODE_FINAL_ROI_TRACK)
+            and any(
+                0 < int(obj.class_id) < len(labels)
+                and labels[int(obj.class_id)] == "sqarered"
+                for obj in objects
+            )
+        ):
+            with self._lock:
+                if self.mode == mode and self.target_label == "triangualrblack":
+                    self.target_label = "sqarered"
+                    target_label = self.target_label
+                    self._latest_packet = None
+                    self._latest_submit_ms = 0
+                    self._last_target_center_x = None
+                    self._last_target_center_y = None
+                    self._last_target_area = None
+                    self._last_target_accept_ms = 0
+                    self._search_no_target_frames = 0
+                    self._search_no_target_initial_sent = False
+                    self._search_no_target_acknowledged = False
+                    self._last_search_no_target_ms = 0
+                    self._roi_entry_sent = False
+                    self._track_center_sent = False
+                    self._final_roi_sent = False
+                    final_roi_sent = False
+                    self._last_final_roi_event_ms = 0
+                    # Completion events computed for the former black target
+                    # must not precede this new target notification.
+                    self._pending_events.clear()
+                    self._pending_events.append(
+                        build_event_packet(EVENT_SWITCH_TO_RED_TARGET)
+                    )
+                    print("[TARGET] black->red casualty action=TX11")
+
         reference_x, reference_y = self._reference_point(mode)
         arrangement_object_count = None
         arrangement_neighbor_missing = False
@@ -461,6 +611,7 @@ class VisionSerialController:
         arrangement_decision_timeout = False
         near_view_count = None
         near_view_ids = []
+        near_view_needs_arrangement = False
         near_view_log = None
         now_ms = _now_ms()
         arrangement_waiting = (
@@ -473,13 +624,34 @@ class VisionSerialController:
             # Safety-zone boxes and deprecated class 0 are not counted.
             near_view_ids = self._movable_target_ids(objects, labels)
             near_view_count = len(near_view_ids)
+            if target_label == "triangualrblack":
+                near_view_needs_arrangement = (
+                    near_view_count > 3
+                    or any(
+                        labels[class_id] in ("sqarered", "sqareblue")
+                        for class_id in near_view_ids
+                    )
+                )
+            else:
+                near_view_needs_arrangement = (
+                    near_view_count > 1
+                    or (
+                        target_label in (
+                            config.UART_ZONE_CASUALTY_LABEL, "sqareredgreen"
+                        )
+                        and any(
+                            labels[class_id] != target_label
+                            for class_id in near_view_ids
+                        )
+                    )
+                )
             selected = None
         elif mode == MODE_SEARCH_ZONE:
             candidates = raw_objects if raw_objects is not None else objects
             selected = self._select_nearest_label(
                 candidates, labels, zone_label, reference_x
             )
-        elif mode == MODE_FINAL_ROI_TRACK:
+        elif mode in (MODE_FINAL_ROI_TRACK, MODE_POST_ARRANGE_CHECK):
             selected = self._select_final_roi_target(
                 objects,
                 labels,
@@ -492,15 +664,21 @@ class VisionSerialController:
                 tracking_objects = self._filter_continuous_candidates(
                     objects, now_ms
                 )
+            selection_reference_x = reference_x
+            selection_reference_y = reference_y
+            if mode == CMD_SEARCH:
+                (
+                    selection_reference_x,
+                    selection_reference_y,
+                ) = self._search_selection_reference()
             selected = select_nearest_horizontal_target(
                 tracking_objects,
                 labels,
                 self.frame_width,
                 target_label=target_label,
-                reference_x=reference_x,
-                # Search and tracking both use the active state's X/Y
-                # reference point (the image center for states 03 and 04).
-                reference_y=reference_y,
+                reference_x=selection_reference_x,
+                reference_y=selection_reference_y,
+                vertical_first=(mode == CMD_SEARCH),
             )
         elif arrangement_waiting:
             # Event 02 is moving MG90 back to wide view. Ignore transitional
@@ -567,7 +745,9 @@ class VisionSerialController:
                 else:
                     self._arrangement_no_neighbor_frames = 0
                 arrangement_skip_to_final = (
-                    self._arrangement_no_neighbor_frames
+                    mode == MODE_ARRANGE_RIGHTMOST
+                    and initial_arrangement_decision_pending
+                    and self._arrangement_no_neighbor_frames
                     >= config.UART_ARRANGE_NO_NEIGHBOR_FRAMES
                 )
                 arrangement_decision_timeout = (
@@ -585,7 +765,7 @@ class VisionSerialController:
 
         if arrangement_decision_timeout:
             print(
-                "[ARRANGE-02] decision_timeout={}ms action=TX24".format(
+                "[ARRANGE-02] decision_timeout={}ms action=TX02".format(
                     now_ms - pre_02_decision_started_ms
                 )
             )
@@ -595,6 +775,7 @@ class VisionSerialController:
             CMD_TRACK,
             MODE_WAIT_14_HANDSHAKE,
             MODE_FINAL_ROI_TRACK,
+            MODE_POST_ARRANGE_CHECK,
             MODE_SEARCH_ZONE,
         ):
             selected = self._reject_large_target_jump(
@@ -608,6 +789,7 @@ class VisionSerialController:
                         CMD_TRACK,
                         MODE_WAIT_14_HANDSHAKE,
                         MODE_FINAL_ROI_TRACK,
+                        MODE_POST_ARRANGE_CHECK,
                     )
                 ),
             )
@@ -632,6 +814,7 @@ class VisionSerialController:
         final_target_in_roi = False
         track_center_reached = False
         zone_is_close = False
+        zone_blocker = None
         if selected is not None:
             class_id = int(selected.class_id)
             # Model class 0 is deprecated and must never be transmitted.
@@ -641,17 +824,21 @@ class VisionSerialController:
                     zone_is_close = (
                         zone_area_ratio >= config.UART_ZONE_CLOSE_AREA_RATIO
                     )
+                    target_x_ratio = (
+                        config.UART_ZONE_CASUALTY_X_RATIO
+                        if target_label == config.UART_ZONE_CASUALTY_LABEL
+                        else config.UART_ZONE_SUPPLY_X_RATIO
+                    )
+                    if (
+                        zone_found_sent
+                        and zone_area_ratio > config.UART_ZONE_CENTER_AREA_RATIO
+                    ):
+                        target_x_ratio = 0.50
+                    if zone_found_sent and not zone_close_sent:
+                        zone_blocker = self._find_roi_edge_blocker(objects, labels)
                     if not zone_close_sent and not zone_is_close:
-                        # Before event 16, aim at the center of the zone's left
-                        # half. After event 16, switch to the zone center once
-                        # its visible box occupies more than 25% of the frame.
-                        target_x_ratio = 0.25
-                        if (
-                            zone_found_sent
-                            and zone_area_ratio
-                            > config.UART_ZONE_CENTER_AREA_RATIO
-                        ):
-                            target_x_ratio = 0.50
+                        # Red casualties aim 3/8 inward from the right edge;
+                        # supplies use the left quarter. Keep the >25% center switch.
                         error_x, error_y = self._zone_supply_point_error(
                             selected,
                             reference_x,
@@ -664,6 +851,7 @@ class VisionSerialController:
                 elif mode in (
                     MODE_ARRANGE_RIGHTMOST,
                     MODE_ARRANGE_LEFTMOST,
+                    MODE_POST_ARRANGE_CHECK,
                 ):
                     # Arrangement is MCU-timed/open-loop. Detection remains
                     # active for state decisions and overlays, but no 11-byte
@@ -714,6 +902,30 @@ class VisionSerialController:
                 )
             self._latest_packet = packet
             self._latest_submit_ms = now_ms
+            if (
+                mode == MODE_POST_ARRANGE_CHECK
+                and self.mode == MODE_POST_ARRANGE_CHECK
+                and selected is not None
+            ):
+                self._pending_events.clear()
+                self._pending_events.append(
+                    build_event_packet(EVENT_SKIP_TO_FINAL_TRACK)
+                )
+                self.mode = MODE_FINAL_ROI_TRACK
+                # Coordinates start with the next fresh image, after event 24.
+                self._latest_packet = None
+                self._latest_submit_ms = 0
+                print("[POST-22] target=id{} action=TX24".format(
+                    int(selected.class_id)
+                ))
+            if mode == CMD_SEARCH and self.mode == CMD_SEARCH:
+                if selected is None:
+                    self._search_no_target_frames += 1
+                else:
+                    self._last_search_no_target_ms = 0
+                    self._search_no_target_frames = 0
+                    self._search_no_target_initial_sent = False
+                    self._search_no_target_acknowledged = False
             if arrangement_waiting:
                 self._latest_packet = None
                 self._latest_submit_ms = 0
@@ -728,10 +940,12 @@ class VisionSerialController:
                     now_ms - self._near_view_started_ms
                     >= config.UART_NEAR_VIEW_SETTLE_MS
                 ):
-                    if near_view_count > 1:
+                    # Confirm the resulting action (02/06/24). Black tasks can
+                    # accept one to three black/green objects without arranging.
+                    if near_view_needs_arrangement:
                         count_bucket = 2
                     else:
-                        count_bucket = int(near_view_count)
+                        count_bucket = 1 if near_view_count > 0 else 0
                     if count_bucket == self._near_view_stable_bucket:
                         self._near_view_stable_frames += 1
                     else:
@@ -742,15 +956,28 @@ class VisionSerialController:
                         self._near_view_stable_frames
                         >= config.UART_NEAR_VIEW_STABLE_FRAMES
                     )
+                    first_green_decision = (
+                        count_is_stable
+                        and target_label == "sqareredgreen"
+                        and not self._first_green_near_view_decided
+                    )
+                    if first_green_decision:
+                        self._first_green_near_view_decided = True
                     if (
                         count_is_stable
-                        and near_view_count > 1
+                        and near_view_needs_arrangement
                         and not self._near_view_adjust_sent
                     ):
                         self._pending_events.append(
                             build_event_packet(EVENT_ROI_READY)
                         )
                         self._near_view_adjust_sent = True
+                        if first_green_decision:
+                            self._first_green_both_sides_required = True
+                            # MCU movement is open-loop; keep requesting 02
+                            # even if changing camera view hides the side box.
+                            self._arrangement_02_without_side = True
+                            print("[NEAR-05] first_green=push_right_then_left wait_RX12_then_RX22")
                         # MCU raises MG90 to the wide view. Resume the existing
                         # arrangement-02/12 state machine after it settles.
                         self.mode = MODE_ARRANGE_RIGHTMOST
@@ -773,7 +1000,8 @@ class VisionSerialController:
                         near_view_log = "TX02 arrange_02_wide"
                     elif (
                         count_is_stable
-                        and near_view_count == 1
+                        and near_view_count > 0
+                        and not near_view_needs_arrangement
                         and not self._near_view_result_sent
                     ):
                         self._pending_events.append(
@@ -819,12 +1047,15 @@ class VisionSerialController:
             if arrangement_skip_to_final:
                 self._pending_events.clear()
                 self._pending_events.append(
-                    build_event_packet(EVENT_SKIP_TO_FINAL_TRACK)
+                    build_event_packet(EVENT_ROI_READY)
                 )
-                self.mode = MODE_FINAL_ROI_TRACK
+                # Even without a usable side detection, MCU performs its
+                # timed arrangement and acknowledges completion with 12.
+                self.mode = MODE_ARRANGE_RIGHTMOST
                 self._initial_arrangement_decision_pending = False
                 self._pre_02_decision_started_ms = 0
-                self._arrangement_02_ack_pending = False
+                self._arrangement_02_ack_pending = True
+                self._arrangement_02_without_side = True
                 self._arrangement_side_target_available = False
                 self._last_arrangement_02_event_ms = 0
                 self._latest_packet = None
@@ -884,7 +1115,44 @@ class VisionSerialController:
             ):
                 self._pending_events.append(build_event_packet(EVENT_ZONE_FOUND))
                 self._zone_found_sent = True
-            if mode == MODE_SEARCH_ZONE and zone_is_close:
+            if mode == MODE_SEARCH_ZONE and not self._zone_close_sent:
+                if self._zone_found_sent and selected is not None:
+                    if zone_blocker is not None:
+                        self._zone_obstacle_clear_frames = 0
+                        if self._zone_obstacle_armed:
+                            self._zone_obstacle_frames += 1
+                    else:
+                        # Keep accumulated blocker hits across missed frames.
+                        self._zone_obstacle_clear_frames += 1
+                        if (
+                            not self._zone_obstacle_waiting
+                            and self._zone_obstacle_clear_frames
+                            >= config.UART_ZONE_OBSTACLE_CLEAR_FRAMES
+                        ):
+                            self._zone_obstacle_armed = True
+                else:
+                    self._zone_obstacle_clear_frames = 0
+                if (
+                    self._zone_obstacle_armed
+                    and not self._zone_obstacle_waiting
+                    and self._zone_obstacle_frames
+                    >= config.UART_ZONE_OBSTACLE_CONFIRM_FRAMES
+                ):
+                    self._zone_obstacle_waiting = True
+                    self._pending_events.append(
+                        build_event_packet(EVENT_ZONE_OBSTACLE)
+                    )
+                    print("[ZONE-16] blocker=id{} action=TX36_WAIT_ACK".format(
+                        int(zone_blocker.class_id)
+                    ))
+                if self._zone_obstacle_waiting:
+                    self._latest_packet = None
+                    self._latest_submit_ms = 0
+            if (
+                mode == MODE_SEARCH_ZONE and zone_is_close
+                and not self._zone_obstacle_waiting
+                and (zone_blocker is None or not self._zone_obstacle_armed)
+            ):
                 if not self._zone_close_sent:
                     self._pending_events.append(
                         build_event_packet(EVENT_ZONE_CLOSE)
@@ -915,6 +1183,29 @@ class VisionSerialController:
             or final_roi_sent
         ):
             return selected
+        return None
+
+    def _find_roi_edge_blocker(self, objects, labels):
+        """Find a movable center 20 px outside / 10 px inside the ROI top edge."""
+        if self.tracking_roi is None:
+            return None
+        left, top, width, _ = self.tracking_roi
+        outside = float(config.UART_ZONE_OBSTACLE_EDGE_OUTSIDE_PX)
+        inside = float(config.UART_ZONE_OBSTACLE_EDGE_INSIDE_PX)
+        movable_labels = set(TARGET_SELECTION_COMMANDS.values())
+        for obj in objects:
+            class_id = int(obj.class_id)
+            if class_id <= 0 or class_id >= len(labels):
+                continue
+            if labels[class_id] not in movable_labels:
+                continue
+            center_x = float(obj.x) + float(obj.w) * 0.5
+            center_y = float(obj.y) + float(obj.h) * 0.5
+            if (
+                float(left) <= center_x < float(left) + float(width)
+                and float(top) - outside <= center_y <= float(top) + inside
+            ):
+                return obj
         return None
 
     @staticmethod
@@ -1111,8 +1402,12 @@ class VisionSerialController:
             self._update_arrangement_target_anchor(selected)
         return selected
 
-    def arrangement_side_objects(self, objects, labels):
+    def arrangement_side_objects(self, objects, labels, raw_objects=None):
         """Return accepted left/right neighbors for the state-02 overlay."""
+        objects = self._exclude_objects_in_safety_zones(
+            objects, labels,
+            raw_objects if raw_objects is not None else objects,
+        )
         with self._lock:
             if self.mode != MODE_ARRANGE_RIGHTMOST:
                 return []
@@ -1286,6 +1581,35 @@ class VisionSerialController:
         return filtered
 
     @staticmethod
+    def _exclude_objects_in_safety_zones(objects, labels, zone_detections):
+        """Exclude movable objects whose centers are in red/blue safety boxes."""
+        zone_labels = set(ZONE_SEARCH_COMMANDS.values())
+        zones = [
+            zone for zone in zone_detections
+            if 0 < int(zone.class_id) < len(labels)
+            and labels[int(zone.class_id)] in zone_labels
+            and float(zone.w) > 0 and float(zone.h) > 0
+        ]
+        movable_labels = set(TARGET_SELECTION_COMMANDS.values())
+        eligible = []
+        for obj in objects:
+            class_id = int(obj.class_id)
+            if (
+                0 < class_id < len(labels)
+                and labels[class_id] in movable_labels
+            ):
+                center_x = float(obj.x) + float(obj.w) * 0.5
+                center_y = float(obj.y) + float(obj.h) * 0.5
+                if any(
+                    float(zone.x) <= center_x <= float(zone.x) + float(zone.w)
+                    and float(zone.y) <= center_y <= float(zone.y) + float(zone.h)
+                    for zone in zones
+                ):
+                    continue
+            eligible.append(obj)
+        return eligible
+
+    @staticmethod
     def _movable_target_ids(objects, labels):
         movable_labels = set(TARGET_SELECTION_COMMANDS.values())
         class_ids = []
@@ -1442,7 +1766,7 @@ class VisionSerialController:
                 int(selected.class_id), selected_x, selected_y
             )
         if skip_to_final:
-            action = "TX24"
+            action = "TX02"
         elif selected is not None:
             action = "open_loop"
         else:
@@ -1525,6 +1849,7 @@ class VisionSerialController:
             mode in (
                 MODE_WAIT_14_HANDSHAKE,
                 MODE_FINAL_ROI_TRACK,
+                MODE_POST_ARRANGE_CHECK,
                 MODE_SEARCH_ZONE,
             )
             and self.tracking_roi is not None
@@ -1536,12 +1861,23 @@ class VisionSerialController:
             )
         return self.frame_width * 0.5, self.frame_height * 0.5
 
+    def _search_selection_reference(self):
+        """Return the ROI center used only for state-03 target selection."""
+        if self.tracking_roi is not None:
+            left, top, width, height = self.tracking_roi
+            return (
+                float(left) + float(width) * 0.5,
+                float(top) + float(height) * 0.5,
+            )
+        return self.frame_width * 0.5, self.frame_height * 0.5
+
     def _select_final_roi_target(self, objects, labels, target_label, now_ms):
-        """Select the leftmost unblocked task target for state 24.
+        """Select by primary spacing, otherwise by maximum unblocked center Y.
 
         A movable object whose horizontal box projection overlaps a candidate
         and whose center is lower in the image is considered to be physically
-        in front of that candidate. The blocked candidate is not trackable.
+        in front of that candidate. If no primary spacing candidate exists,
+        select the lowest unblocked target in the image.
         """
         if target_label not in TARGET_SELECTION_COMMANDS.values():
             return None
@@ -1583,6 +1919,35 @@ class VisionSerialController:
                 unblocked.append(candidate)
 
         if not unblocked:
+            secondary_candidates = []
+        else:
+            secondary_candidates = unblocked
+
+        primary_candidates = [
+            candidate
+            for candidate in candidates
+            if self._matches_final_primary_spacing(
+                candidate,
+                movable_objects,
+            )
+        ]
+        if not primary_candidates and secondary_candidates:
+            max_center_y = max(
+                float(obj.y) + float(obj.h) * 0.5
+                for obj in secondary_candidates
+            )
+            # Y is the fallback's first key; continuity may only break ties
+            # among equally low targets, not keep a higher target locked.
+            secondary_candidates = [
+                obj for obj in secondary_candidates
+                if float(obj.y) + float(obj.h) * 0.5 == max_center_y
+            ]
+        eligible_candidates = (
+            primary_candidates
+            if primary_candidates
+            else secondary_candidates
+        )
+        if not eligible_candidates:
             return None
 
         with self._lock:
@@ -1592,8 +1957,8 @@ class VisionSerialController:
             previous_ms = self._last_target_accept_ms
 
         # Keep a still-valid tracked target to avoid frame-to-frame hopping.
-        # If it is now blocked or missing, deliberately switch to the leftmost
-        # remaining target and clear the old continuity anchor.
+        # If it is no longer eligible, choose from the new eligible set and
+        # clear the old continuity anchor before accepting the deliberate switch.
         continuous = []
         if (
             previous_x is not None
@@ -1601,7 +1966,7 @@ class VisionSerialController:
             and previous_area is not None
             and now_ms - previous_ms < config.UART_X_JUMP_RESET_MS
         ):
-            for candidate in unblocked:
+            for candidate in eligible_candidates:
                 center_x = float(candidate.x) + float(candidate.w) * 0.5
                 center_y = float(candidate.y) + float(candidate.h) * 0.5
                 area = max(1.0, float(candidate.w) * float(candidate.h))
@@ -1631,7 +1996,7 @@ class VisionSerialController:
             )
 
         selected = min(
-            unblocked,
+            eligible_candidates,
             key=lambda obj: (
                 float(obj.x) + float(obj.w) * 0.5,
                 -float(getattr(obj, "score", 0.0)),
@@ -1643,6 +2008,51 @@ class VisionSerialController:
             self._last_target_area = None
             self._last_target_accept_ms = 0
         return selected
+
+    @staticmethod
+    def _matches_final_primary_spacing(candidate, movable_objects):
+        """Apply the perspective dx/dy rule against the nearest X neighbor."""
+        center_x = float(candidate.x) + float(candidate.w) * 0.5
+        center_y = float(candidate.y) + float(candidate.h) * 0.5
+        neighbors = []
+        for other in movable_objects:
+            if other is candidate:
+                continue
+            other_x = float(other.x) + float(other.w) * 0.5
+            other_y = float(other.y) + float(other.h) * 0.5
+            neighbors.append(
+                (
+                    abs(other_x - center_x),
+                    abs(other_y - center_y),
+                )
+            )
+        if not neighbors:
+            return False
+
+        delta_x, delta_y = min(neighbors, key=lambda gap: (gap[0], gap[1]))
+        max_delta_y = None
+        if center_y > 290:
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_GT_290
+            max_delta_y = config.UART_FINAL_PRIMARY_MAX_DY
+        elif center_y > 220:
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_GT_220
+            max_delta_y = config.UART_FINAL_PRIMARY_MAX_DY
+        elif center_y > 150:
+            # The user's later rule overrides the earlier dy<30 rule for this
+            # duplicated Y band, so only dx is checked here.
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_GT_150
+        elif center_y > 100:
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_GT_100
+        elif center_y > 90:
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_GT_90
+        else:
+            min_delta_x = config.UART_FINAL_PRIMARY_MIN_DX_Y_LE_90
+
+        if delta_x <= min_delta_x:
+            return False
+        if max_delta_y is not None and delta_y >= max_delta_y:
+            return False
+        return True
 
     def _select_nearest_label(
         self, objects, labels, required_label, reference_x=None
@@ -1687,6 +2097,8 @@ class VisionSerialController:
                 packet = self._pending_events.pop(0)
                 if packet == build_event_packet(EVENT_FINAL_TARGET_IN_ROI):
                     self._last_final_roi_event_ms = now_ms
+                elif packet == build_event_packet(EVENT_ZONE_OBSTACLE):
+                    self._last_zone_obstacle_event_ms = now_ms
                 elif (
                     packet == build_event_packet(EVENT_ROI_READY)
                     and self.mode == MODE_ARRANGE_RIGHTMOST
@@ -1695,10 +2107,22 @@ class VisionSerialController:
                     self._last_arrangement_02_event_ms = now_ms
                 return packet
 
+            if self.mode == MODE_SEARCH_ZONE and self._zone_obstacle_waiting:
+                if (
+                    now_ms - self._last_zone_obstacle_event_ms
+                    >= config.UART_ZONE_OBSTACLE_REPEAT_MS
+                ):
+                    self._last_zone_obstacle_event_ms = now_ms
+                    return build_event_packet(EVENT_ZONE_OBSTACLE)
+                return None
+
             if (
                 self.mode == MODE_ARRANGE_RIGHTMOST
                 and self._arrangement_02_ack_pending
-                and self._arrangement_side_target_available
+                and (
+                    self._arrangement_side_target_available
+                    or self._arrangement_02_without_side
+                )
                 and now_ms - self._last_arrangement_02_event_ms
                 >= config.UART_ARRANGE_02_REPEAT_MS
             ):
@@ -1720,6 +2144,26 @@ class VisionSerialController:
                 <= config.UART_TARGET_FRESHNESS_MS
             ):
                 return self._latest_packet
+
+            if (
+                self.mode == CMD_SEARCH
+                and self._latest_submit_ms > 0
+                and self._latest_packet is None
+                and self._search_no_target_frames
+                >= config.UART_SEARCH_NO_TARGET_FRAMES
+            ):
+                if not self._search_no_target_initial_sent:
+                    self._search_no_target_initial_sent = True
+                    self._search_no_target_acknowledged = False
+                    self._last_search_no_target_ms = now_ms
+                    return build_event_packet(EVENT_SEARCH_NO_TARGET)
+                if (
+                    self._search_no_target_acknowledged
+                    and now_ms - self._last_search_no_target_ms
+                    >= config.UART_NO_TARGET_REPEAT_MS
+                ):
+                    self._last_search_no_target_ms = now_ms
+                    return build_event_packet(EVENT_SEARCH_NO_TARGET)
 
             if (
                 self.mode in (MODE_ARRANGE_RIGHTMOST, MODE_ARRANGE_LEFTMOST)

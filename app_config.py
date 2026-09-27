@@ -1,6 +1,6 @@
 """Application settings shared by the MaixCAM YOLO modules."""
 
-MODEL_PATH = "/root/sd/gongxun27/model_9297.mud"
+MODEL_PATH = "/root/sd/gongxun27/model_9320.mud"
 
 # ISP image quality settings.
 AUTO_AWB = True
@@ -51,6 +51,9 @@ UART_SEND_RATE_HZ = 20
 UART_READ_POLL_MS = 5
 UART_TARGET_FRESHNESS_MS = 200
 UART_NO_TARGET_REPEAT_MS = 500
+# State 03 must miss its selected target for this many consecutive frames
+# before reporting E3, preventing one-frame detection flicker from triggering it.
+UART_SEARCH_NO_TARGET_FRAMES = 3
 # Repeat event 34 while state 24 is waiting for the MCU's 15/25 command.
 UART_FINAL_ROI_EVENT_REPEAT_MS = 500
 # Repeat arrangement event 02 until MCU acknowledges it with command 12.
@@ -69,6 +72,15 @@ UART_FRAME_CENTER_TOLERANCE_Y = 20
 # event 34; merely entering the large full-width ROI is not sufficient.
 UART_FINAL_ROI_CENTER_TOLERANCE_X = 20
 UART_FINAL_ROI_CENTER_TOLERANCE_Y = 20
+# State-24 primary target spacing rules use absolute box-center Y and the
+# nearest movable object's box-center dx/dy. Threshold comparisons are strict.
+UART_FINAL_PRIMARY_MAX_DY = 30
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_290 = 200
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_220 = 150
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_150 = 120
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_100 = 90
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_90 = 70
+UART_FINAL_PRIMARY_MIN_DX_Y_LE_90 = 60
 # Arrangement states 02/12 only identify side objects and drive event/state
 # decisions. Their MCU movement is timed/open-loop; no coordinate packet is sent.
 UART_ARRANGE_MAX_Y_DIFFERENCE = 80
@@ -79,13 +91,23 @@ UART_ARRANGE_NO_NEIGHBOR_FRAMES = 5
 UART_ARRANGE_DEBUG_PRINT_MS = 500
 # After event 05, allow the MCU-operated camera mechanism to reach its near
 # position, then require a stable full-frame object count before deciding.
-UART_NEAR_VIEW_SETTLE_MS = 800
+UART_NEAR_VIEW_SETTLE_MS = 500
 UART_NEAR_VIEW_STABLE_FRAMES = 3
 # Event 02 makes the MCU return MG90 to the wide-angle position before the
 # existing arrangement-02/12 vision logic resumes.
 UART_WIDE_VIEW_SETTLE_MS = 800
 UART_ZONE_CENTER_AREA_RATIO = 0.25
 UART_ZONE_CLOSE_AREA_RATIO = 0.50
+# Red objects are casualties; green/black/light-blue objects are supplies.
+UART_ZONE_CASUALTY_LABEL = "sqarered"
+UART_ZONE_CASUALTY_X_RATIO = 0.75
+UART_ZONE_SUPPLY_X_RATIO = 0.25
+# Safety-zone approach: 20 px outside / 10 px inside the ROI top edge.
+UART_ZONE_OBSTACLE_EDGE_OUTSIDE_PX = 20
+UART_ZONE_OBSTACLE_EDGE_INSIDE_PX = 10
+UART_ZONE_OBSTACLE_CONFIRM_FRAMES = 3
+UART_ZONE_OBSTACLE_CLEAR_FRAMES = 3
+UART_ZONE_OBSTACLE_REPEAT_MS = 500
 
 # Streaming settings.
 STREAM_WIDTH = 576

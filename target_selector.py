@@ -51,14 +51,17 @@ def select_nearest_horizontal_target(
     target_label=None,
     reference_x=None,
     reference_y=None,
+    vertical_first=False,
 ):
     """Return the target nearest to the supplied reference.
 
     ``target_label`` is reserved for the MCU color command. Passing ``None``
     accepts all four movable target classes. Invalid and safety-zone classes
     are ignored. When ``reference_y`` is supplied, squared X/Y distance is
-    used; otherwise selection remains X-only. Confidence breaks equal-distance
-    ties. The horizontal frame center is the default X reference.
+    used; otherwise selection remains X-only. When ``vertical_first`` is true,
+    absolute Y distance is the primary key and absolute X distance is the
+    secondary key. Confidence breaks equal-distance ties. The horizontal frame
+    center is the default X reference.
     """
     if target_label is not None and target_label not in TARGET_LABELS:
         return None
@@ -81,16 +84,23 @@ def select_nearest_horizontal_target(
 
         object_center_x = float(obj.x) + float(obj.w) * 0.5
         horizontal_error = abs(object_center_x - float(reference_x))
+        confidence = float(getattr(obj, "score", 0.0))
         if reference_y is None:
-            distance = horizontal_error
+            candidate_key = (horizontal_error, -confidence)
         else:
             object_center_y = float(obj.y) + float(obj.h) * 0.5
-            vertical_error = object_center_y - float(reference_y)
-            distance = horizontal_error * horizontal_error + (
-                vertical_error * vertical_error
-            )
-        confidence = float(getattr(obj, "score", 0.0))
-        candidate_key = (distance, -confidence)
+            vertical_error = abs(object_center_y - float(reference_y))
+            if vertical_first:
+                candidate_key = (
+                    vertical_error,
+                    horizontal_error,
+                    -confidence,
+                )
+            else:
+                distance = horizontal_error * horizontal_error + (
+                    vertical_error * vertical_error
+                )
+                candidate_key = (distance, -confidence)
         if selected_key is None or candidate_key < selected_key:
             selected = obj
             selected_key = candidate_key

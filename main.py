@@ -22,6 +22,7 @@ from performance_debug import PerformanceProfiler
 from serial_controller import VisionSerialController
 from vision_overlay import (
     draw_arrangement_side_targets,
+    draw_debug_adjacent_coordinate_gaps,
     draw_debug_detections,
     draw_debug_safety_zone_areas,
     draw_roi_border,
@@ -106,6 +107,7 @@ def main():
                 serial_controller.arrangement_side_objects(
                     verified_objects,
                     detector.labels,
+                    raw_objects=objects,
                 )
             )
             stage_start_us = profiler.mark("serial", stage_start_us)
@@ -125,6 +127,13 @@ def main():
                 draw_debug_safety_zone_areas(
                     img,
                     objects,
+                    detector.labels,
+                    detector.input_width(),
+                    detector.input_height(),
+                )
+                draw_debug_adjacent_coordinate_gaps(
+                    img,
+                    verified_objects,
                     detector.labels,
                     detector.input_width(),
                     detector.input_height(),

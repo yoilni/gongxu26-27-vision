@@ -26,6 +26,15 @@ DEBUG_BOX_COLOR = image.Color.from_rgb(220, 220, 220)
 DEBUG_AREA_TEXT_COLOR = image.COLOR_BLACK
 DEBUG_AREA_TEXT_SCALE = 1.5
 DEBUG_AREA_TEXT_THICKNESS = 1
+DEBUG_X_GAP_COLOR = image.COLOR_BLACK
+DEBUG_X_GAP_LINE_THICKNESS = 1
+DEBUG_X_GAP_TEXT_SCALE = 1.5
+DEBUG_X_GAP_TEXT_THICKNESS = 1
+DEBUG_ABSOLUTE_Y_COLOR = image.COLOR_RED
+DEBUG_ABSOLUTE_Y_TEXT_SCALE = 1.5
+DEBUG_ABSOLUTE_Y_TEXT_THICKNESS = 1
+DEBUG_ABSOLUTE_Y_TOP = 36
+DEBUG_ABSOLUTE_Y_LINE_SPACING = 26
 ARRANGEMENT_SIDE_COLOR = image.COLOR_RED
 ARRANGEMENT_SIDE_THICKNESS = 3
 
@@ -136,6 +145,73 @@ def draw_debug_safety_zone_areas(img, objects, labels, frame_width, frame_height
             color=DEBUG_AREA_TEXT_COLOR,
             scale=DEBUG_AREA_TEXT_SCALE,
             thickness=DEBUG_AREA_TEXT_THICKNESS,
+        )
+
+
+def draw_debug_adjacent_coordinate_gaps(
+    img, objects, labels, frame_width, frame_height
+):
+    """Show center-X/Y differences between adjacent verified movable objects."""
+    frame_width = int(frame_width)
+    frame_height = int(frame_height)
+    centers = []
+
+    for obj in objects:
+        class_id = int(obj.class_id)
+        if class_id <= 0 or class_id >= len(labels):
+            continue
+        if labels[class_id] not in LABEL_COLORS:
+            continue
+
+        center_x = int(round(float(obj.x) + float(obj.w) * 0.5))
+        center_y = int(round(float(obj.y) + float(obj.h) * 0.5))
+        centers.append((center_x, center_y))
+
+    centers.sort(key=lambda center: (center[0], center[1]))
+    for left_center, right_center in zip(centers, centers[1:]):
+        left_x, left_y = left_center
+        right_x, right_y = right_center
+        delta_x = max(0, right_x - left_x)
+        delta_y = abs(right_y - left_y)
+
+        img.draw_line(
+            left_x,
+            left_y,
+            right_x,
+            right_y,
+            color=DEBUG_X_GAP_COLOR,
+            thickness=DEBUG_X_GAP_LINE_THICKNESS,
+        )
+
+        text = "dx={} dy={}".format(delta_x, delta_y)
+        text_x = max(0, min(frame_width - 150, (left_x + right_x) // 2 - 60))
+        text_y = max(0, min(frame_height - 28, (left_y + right_y) // 2 - 24))
+        img.draw_string(
+            text_x,
+            text_y,
+            text,
+            color=DEBUG_X_GAP_COLOR,
+            scale=DEBUG_X_GAP_TEXT_SCALE,
+            thickness=DEBUG_X_GAP_TEXT_THICKNESS,
+        )
+
+    # List absolute center-Y coordinates at the upper-right. The numbering is
+    # the same left-to-right order used for the adjacent dx/dy measurements.
+    text_x = max(0, frame_width - 120)
+    for index, (_, center_y) in enumerate(centers, start=1):
+        text_y = (
+            DEBUG_ABSOLUTE_Y_TOP
+            + (index - 1) * DEBUG_ABSOLUTE_Y_LINE_SPACING
+        )
+        if text_y > frame_height - 28:
+            break
+        img.draw_string(
+            text_x,
+            text_y,
+            "{}:y={}".format(index, center_y),
+            color=DEBUG_ABSOLUTE_Y_COLOR,
+            scale=DEBUG_ABSOLUTE_Y_TEXT_SCALE,
+            thickness=DEBUG_ABSOLUTE_Y_TEXT_THICKNESS,
         )
 
 
