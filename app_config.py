@@ -53,7 +53,7 @@ UART_TARGET_FRESHNESS_MS = 200
 UART_NO_TARGET_REPEAT_MS = 500
 # State 03 must miss its selected target for this many consecutive frames
 # before reporting E3, preventing one-frame detection flicker from triggering it.
-UART_SEARCH_NO_TARGET_FRAMES = 3
+UART_SEARCH_NO_TARGET_FRAMES = 5
 # Repeat event 34 while state 24 is waiting for the MCU's 15/25 command.
 UART_FINAL_ROI_EVENT_REPEAT_MS = 500
 # Repeat arrangement event 02 until MCU acknowledges it with command 12.
@@ -100,7 +100,8 @@ UART_ZONE_CENTER_AREA_RATIO = 0.25
 UART_ZONE_CLOSE_AREA_RATIO = 0.50
 # Red objects are casualties; green/black/light-blue objects are supplies.
 UART_ZONE_CASUALTY_LABEL = "sqarered"
-UART_ZONE_CASUALTY_X_RATIO = 0.75
+# Aim 3/8 of the safety-zone width inward from the right boundary.
+UART_ZONE_CASUALTY_X_RATIO = 0.625
 UART_ZONE_SUPPLY_X_RATIO = 0.25
 # Safety-zone approach: 20 px outside / 10 px inside the ROI top edge.
 UART_ZONE_OBSTACLE_EDGE_OUTSIDE_PX = 20

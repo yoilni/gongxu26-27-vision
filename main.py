@@ -49,7 +49,7 @@ def configure_camera(detector):
 def main():
     os.makedirs(config.RECORD_DIR, exist_ok=True)
 
-    detector = nn.YOLO26(model=config.MODEL_PATH, dual_buff=False)
+    detector = nn.YOLO26(model=config.MODEL_PATH, dual_buff=True)
     cam = configure_camera(detector)
     disp = display.Display()
     touch = touchscreen.TouchScreen()

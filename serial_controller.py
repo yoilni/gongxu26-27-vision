@@ -40,6 +40,8 @@ CMD_SORT = 0x02
 CMD_SEARCH = 0x03
 CMD_TRACK = 0x04
 CMD_SEARCH_SWEEP_DONE = 0x13
+CMD_TRACK_RECOVERY_DONE = 0x44
+CMD_FINAL_SEARCH_DONE = 0xF1
 CMD_ZONE_OBSTACLE_DONE = 0x36
 CMD_TRACK_CENTER_DONE = 0x14
 CMD_ARRANGE_FIRST_DONE = 0x12
@@ -51,6 +53,7 @@ CMD_RECHECK_SORT = 0xA5
 # object remains, event 06 transitions internally to safety-zone searching.
 MODE_NEAR_VIEW_CHECK = 0x05
 MODE_SEARCH_ZONE = 0x06
+MODE_WAIT_04_HANDSHAKE = 0x104
 MODE_WAIT_14_HANDSHAKE = 0x114
 MODE_ARRANGE_RIGHTMOST = 0x102
 MODE_ARRANGE_LEFTMOST = 0x112
@@ -71,12 +74,15 @@ CMD_SELECT_BLUE_OBJECT = 0x01
 CMD_SELECT_RED_OBJECT = 0x11
 CMD_SELECT_GREEN_OBJECT = 0x21
 CMD_SELECT_BLACK_OBJECT = 0x31
+CMD_SELECT_BLACK_OR_GREEN = 0x51
+TARGET_BLACK_OR_GREEN = "black_or_green"
 
 TARGET_SELECTION_COMMANDS = {
     CMD_SELECT_BLUE_OBJECT: "sqareblue",       # model ID 3
     CMD_SELECT_RED_OBJECT: "sqarered",         # model ID 4
     CMD_SELECT_GREEN_OBJECT: "sqareredgreen",  # model ID 5
     CMD_SELECT_BLACK_OBJECT: "triangualrblack",# model ID 6
+    CMD_SELECT_BLACK_OR_GREEN: TARGET_BLACK_OR_GREEN,
 }
 ZONE_SEARCH_COMMANDS = {
     CMD_SEARCH_RED_ZONE: "redsafety",          # model ID 2
@@ -102,6 +108,7 @@ EVENT_MULTI_GREEN = 0xC5
 EVENT_NO_TASK_TARGET = 0xD5
 EVENT_ARRANGEMENT_NO_OBJECT = 0xE2
 EVENT_SEARCH_NO_TARGET = 0xE3
+EVENT_TRACK_NO_TARGET = 0xE4
 EVENT_UNCERTAIN = 0xE5
 EVENT_NO_TARGET = 0xEE
 
@@ -122,8 +129,9 @@ EVENT_NAMES = {
     EVENT_SINGLE_GREEN: "SINGLE_GREEN",
     EVENT_MULTI_GREEN: "MULTI_GREEN",
     EVENT_NO_TASK_TARGET: "NO_TASK_TARGET",
-    EVENT_ARRANGEMENT_NO_OBJECT: "ARRANGE_NO_OBJECT",
+    EVENT_ARRANGEMENT_NO_OBJECT: "POST_22_NO_TARGET",
     EVENT_SEARCH_NO_TARGET: "SEARCH_NO_TARGET",
+    EVENT_TRACK_NO_TARGET: "TRACK_NO_TARGET",
     EVENT_UNCERTAIN: "UNCERTAIN",
     EVENT_NO_TARGET: "NO_TARGET",
 }
@@ -219,6 +227,9 @@ class VisionSerialController:
         self._latest_packet = None
         self._latest_submit_ms = 0
         self._last_no_target_ms = 0
+        self._final_search_waiting_ack = False
+        self._last_track_no_target_ms = 0
+        self._track_green_recovery_waiting = False
         self._last_search_no_target_ms = 0
         self._search_no_target_frames = 0
         self._search_no_target_initial_sent = False
@@ -299,7 +310,7 @@ class VisionSerialController:
                 "target_cmds_01_11_21_31_v1 repeat34_while_centered_v2 "
                 "repeat02_until12_500ms_v1 pre02_timeout2500_v1 "
                 "final24_primary_spacing_v1 search03_e3_ack13_v2 "
-                "search03_missing3_v1 search03_roi_yx_v1 zone16_obstacle36_v1 "
+                "search03_missing5_v2 search03_roi_yx_v1 zone16_obstacle36_v1 "
                 "exclude_safe_zone_targets_v1 zone36_roi_out20_in10_v3 "
                 "zone_red_casualty_right625_v2 final24_fallback_max_y_v2 "
                 "near05_red_foreign_arrange_v1 near05_black_green_rules_v2 "
@@ -335,6 +346,46 @@ class VisionSerialController:
         description = None
         search_no_target_ack = False
         with self._lock:
+            if (
+                command == CMD_FINAL_SEARCH_DONE
+                and self.mode == MODE_FINAL_ROI_TRACK
+                and self._final_search_waiting_ack
+            ):
+                self._final_search_waiting_ack = False
+                self._latest_packet = None
+                self._latest_submit_ms = 0
+                self._last_no_target_ms = 0
+                self._last_target_center_x = None
+                self._last_target_center_y = None
+                self._last_target_area = None
+                self._last_target_accept_ms = 0
+                self._final_roi_sent = False
+                self._last_final_roi_event_ms = 0
+                self._pending_events.clear()
+                print("Vision UART command 0xF1: search_done=recheck_FINAL_ROI_fresh_image")
+                return
+            if (
+                command == CMD_TRACK_RECOVERY_DONE
+                and self.mode in (CMD_TRACK, MODE_WAIT_14_HANDSHAKE)
+            ):
+                # MCU finished the first-green open-loop recovery. Discard
+                # old image data and reacquire after its push/reverse motion.
+                self._latest_packet = None
+                self._latest_submit_ms = 0
+                self._last_target_center_x = None
+                self._last_target_center_y = None
+                self._last_target_area = None
+                self._last_target_accept_ms = 0
+                self._last_track_no_target_ms = 0
+                self._track_green_recovery_waiting = False
+                self._track_center_sent = False
+                self.mode = CMD_TRACK
+                pending_14 = build_event_packet(EVENT_TRACK_CENTER_REACHED)
+                self._pending_events = [
+                    event for event in self._pending_events if event != pending_14
+                ]
+                print("Vision UART command 0x44: recovery_done=resume_TRACK_fresh_image")
+                return
             if (
                 command == CMD_ARRANGE_SECOND_DONE
                 and self._first_green_both_sides_required
@@ -476,6 +527,7 @@ class VisionSerialController:
                 changed = True
             elif command in TARGET_SELECTION_COMMANDS:
                 self._first_green_both_sides_required = False
+                self._pending_events.clear()
                 self.target_label = TARGET_SELECTION_COMMANDS[command]
                 description = "target=" + self.target_label
                 if command == CMD_SELECT_BLACK_OBJECT:
@@ -484,7 +536,11 @@ class VisionSerialController:
                     description += " mode=FINAL_ROI_TRACK"
                 changed = True
             if changed:
+                self._final_search_waiting_ack = False
                 self._arrangement_02_without_side = False
+                self._last_track_no_target_ms = 0
+                self._track_green_recovery_waiting = False
+                self._last_arrangement_no_object_ms = 0
                 # Do not reuse data collected for the previous state/class.
                 self._latest_packet = None
                 self._latest_submit_ms = 0
@@ -651,14 +707,28 @@ class VisionSerialController:
             selected = self._select_nearest_label(
                 candidates, labels, zone_label, reference_x
             )
-        elif mode in (MODE_FINAL_ROI_TRACK, MODE_POST_ARRANGE_CHECK):
+        elif (
+            mode in (MODE_FINAL_ROI_TRACK, MODE_POST_ARRANGE_CHECK)
+            or (mode == CMD_TRACK and target_label == "sqarered")
+            or (
+                target_label == TARGET_BLACK_OR_GREEN
+                and mode in (
+                    CMD_SEARCH, CMD_TRACK,
+                    MODE_WAIT_04_HANDSHAKE, MODE_WAIT_14_HANDSHAKE,
+                )
+            )
+        ):
+            # Red state-04 uses the same primary/secondary target eligibility
+            # as state 24, while its coordinate reference stays image-center.
             selected = self._select_final_roi_target(
                 objects,
                 labels,
                 target_label,
                 now_ms,
             )
-        elif mode in (CMD_SEARCH, CMD_TRACK, MODE_WAIT_14_HANDSHAKE):
+        elif mode in (
+            CMD_SEARCH, CMD_TRACK, MODE_WAIT_04_HANDSHAKE, MODE_WAIT_14_HANDSHAKE
+        ):
             tracking_objects = objects
             if target_label == "sqareredgreen":
                 tracking_objects = self._filter_continuous_candidates(
@@ -773,6 +843,7 @@ class VisionSerialController:
         if mode in (
             CMD_SEARCH,
             CMD_TRACK,
+            MODE_WAIT_04_HANDSHAKE,
             MODE_WAIT_14_HANDSHAKE,
             MODE_FINAL_ROI_TRACK,
             MODE_POST_ARRANGE_CHECK,
@@ -787,6 +858,7 @@ class VisionSerialController:
                     in (
                         CMD_SEARCH,
                         CMD_TRACK,
+                        MODE_WAIT_04_HANDSHAKE,
                         MODE_WAIT_14_HANDSHAKE,
                         MODE_FINAL_ROI_TRACK,
                         MODE_POST_ARRANGE_CHECK,
@@ -865,6 +937,14 @@ class VisionSerialController:
                         reference_x=reference_x,
                         reference_y=reference_y,
                     )
+                    final_target_below_roi_center = (
+                        mode == MODE_FINAL_ROI_TRACK
+                        and self.tracking_roi is not None
+                        and float(selected.y) + float(selected.h) * 0.5
+                        > reference_y
+                    )
+                    if final_target_below_roi_center:
+                        error_y = 0
                     packet = build_coordinate_packet(
                         class_id, error_x, error_y
                     )
@@ -872,8 +952,11 @@ class VisionSerialController:
                         mode == MODE_FINAL_ROI_TRACK
                         and abs(error_x)
                         <= config.UART_FINAL_ROI_CENTER_TOLERANCE_X
-                        and abs(error_y)
-                        <= config.UART_FINAL_ROI_CENTER_TOLERANCE_Y
+                        and (
+                            final_target_below_roi_center
+                            or abs(error_y)
+                            <= config.UART_FINAL_ROI_CENTER_TOLERANCE_Y
+                        )
                     )
                     track_center_reached = (
                         mode == CMD_TRACK
@@ -902,6 +985,8 @@ class VisionSerialController:
                 )
             self._latest_packet = packet
             self._latest_submit_ms = now_ms
+            if mode == CMD_TRACK and selected is not None:
+                self._last_track_no_target_ms = 0
             if (
                 mode == MODE_POST_ARRANGE_CHECK
                 and self.mode == MODE_POST_ARRANGE_CHECK
@@ -1070,13 +1155,16 @@ class VisionSerialController:
                     build_event_packet(EVENT_SEARCH_CENTER_REACHED)
                 )
                 self._roi_entry_sent = True
-                # MCU does not echo command 04. Move directly into the center
-                # tracking stage so the next qualifying frame can emit 14.
-                self.mode = CMD_TRACK
+                # Keep publishing image-center errors, but do not emit 14
+                # until MCU returns command 04 to enter CMD_TRACK.
+                self.mode = MODE_WAIT_04_HANDSHAKE
                 self._track_center_sent = False
             elif selected is not None and not target_in_roi:
                 self._roi_entry_sent = False
-            if track_center_reached and not self._track_center_sent:
+            if (
+                track_center_reached and not self._track_center_sent
+                and not self._track_green_recovery_waiting
+            ):
                 self._pending_events.append(
                     build_event_packet(EVENT_TRACK_CENTER_REACHED)
                 )
@@ -1462,7 +1550,7 @@ class VisionSerialController:
             for obj in objects
             if int(obj.class_id) > 0
             and int(obj.class_id) < len(labels)
-            and labels[int(obj.class_id)] == middle_label
+            and labels[int(obj.class_id)] in self._eligible_target_labels(middle_label)
         ]
         if not middle_candidates:
             return None
@@ -1701,7 +1789,7 @@ class VisionSerialController:
         state_name = "02" if mode == MODE_ARRANGE_RIGHTMOST else "12"
         if middle is None:
             same_label_visible = any(
-                labels[int(obj.class_id)] == middle_label
+                labels[int(obj.class_id)] in self._eligible_target_labels(middle_label)
                 for obj in valid_objects
             )
             middle_text = (
@@ -1835,7 +1923,7 @@ class VisionSerialController:
 
     def _reference_point(self, mode):
         """Return the state-specific coordinate error reference point."""
-        if mode in (CMD_SEARCH, CMD_TRACK):
+        if mode in (CMD_SEARCH, CMD_TRACK, MODE_WAIT_04_HANDSHAKE):
             return self.frame_width * 0.5, self.frame_height * 0.5
         if mode in (MODE_ARRANGE_RIGHTMOST, MODE_ARRANGE_LEFTMOST):
             if self.tracking_roi is not None:
@@ -1871,13 +1959,19 @@ class VisionSerialController:
             )
         return self.frame_width * 0.5, self.frame_height * 0.5
 
+    @staticmethod
+    def _eligible_target_labels(target_label):
+        if target_label == TARGET_BLACK_OR_GREEN:
+            return ("triangualrblack", "sqareredgreen")
+        return (target_label,)
+
     def _select_final_roi_target(self, objects, labels, target_label, now_ms):
-        """Select by primary spacing, otherwise by maximum unblocked center Y.
+        """Prefer maximum unblocked center Y, then use spacing as fallback.
 
         A movable object whose horizontal box projection overlaps a candidate
         and whose center is lower in the image is considered to be physically
-        in front of that candidate. If no primary spacing candidate exists,
-        select the lowest unblocked target in the image.
+        in front of that candidate. Select the lowest unblocked target first;
+        use the original perspective spacing rules only if none is available.
         """
         if target_label not in TARGET_SELECTION_COMMANDS.values():
             return None
@@ -1893,7 +1987,7 @@ class VisionSerialController:
             if label not in movable_labels:
                 continue
             movable_objects.append(obj)
-            if label == target_label:
+            if label in self._eligible_target_labels(target_label):
                 candidates.append(obj)
 
         unblocked = []
@@ -1918,12 +2012,7 @@ class VisionSerialController:
             if not blocked:
                 unblocked.append(candidate)
 
-        if not unblocked:
-            secondary_candidates = []
-        else:
-            secondary_candidates = unblocked
-
-        primary_candidates = [
+        secondary_candidates = [
             candidate
             for candidate in candidates
             if self._matches_final_primary_spacing(
@@ -1931,15 +2020,16 @@ class VisionSerialController:
                 movable_objects,
             )
         ]
-        if not primary_candidates and secondary_candidates:
+        primary_candidates = unblocked
+        if primary_candidates:
             max_center_y = max(
                 float(obj.y) + float(obj.h) * 0.5
-                for obj in secondary_candidates
+                for obj in primary_candidates
             )
-            # Y is the fallback's first key; continuity may only break ties
+            # Y is the primary key; continuity may only break ties
             # among equally low targets, not keep a higher target locked.
-            secondary_candidates = [
-                obj for obj in secondary_candidates
+            primary_candidates = [
+                obj for obj in primary_candidates
                 if float(obj.y) + float(obj.h) * 0.5 == max_center_y
             ]
         eligible_candidates = (
@@ -2166,19 +2256,38 @@ class VisionSerialController:
                     return build_event_packet(EVENT_SEARCH_NO_TARGET)
 
             if (
-                self.mode in (MODE_ARRANGE_RIGHTMOST, MODE_ARRANGE_LEFTMOST)
+                self.mode == CMD_TRACK
                 and self._latest_submit_ms > 0
-                and self._arrangement_object_count == 0
-                and now_ms - self._last_arrangement_no_object_ms
-                >= config.UART_NO_TARGET_REPEAT_MS
+                and self._latest_packet is None
+                and (
+                    self._last_track_no_target_ms == 0
+                    or now_ms - self._last_track_no_target_ms
+                    >= config.UART_NO_TARGET_REPEAT_MS
+                )
             ):
-                # An E2 recovery maneuver can legitimately change Y and box
-                # area. Preserve the middle target's X identity, release the
-                # side lock, and let the next frames reacquire both anchors.
-                if self._middle_target_anchor is not None:
-                    middle_x = self._middle_target_anchor[0]
-                    self._middle_target_anchor = (middle_x, None, None)
-                self._arrangement_target_anchor = None
+                self._last_track_no_target_ms = now_ms
+                if (
+                    self.target_label == "sqareredgreen"
+                    and not self._first_green_near_view_decided
+                ):
+                    # Coordinates may reappear while MCU finishes its first
+                    # green push; do not advance to 14 until its 44 handshake.
+                    self._track_green_recovery_waiting = True
+                return build_event_packet(EVENT_TRACK_NO_TARGET)
+
+            if (
+                self.mode == MODE_POST_ARRANGE_CHECK
+                and self._latest_submit_ms > 0
+                and self._latest_packet is None
+                and (
+                    self._last_arrangement_no_object_ms == 0
+                    or now_ms - self._last_arrangement_no_object_ms
+                    >= config.UART_NO_TARGET_REPEAT_MS
+                )
+            ):
+                # MCU's interruptible recovery changes the camera viewpoint.
+                # Keep checking fresh frames; a valid target emits 24 before
+                # any coordinate packet and stops these E2 reports.
                 self._last_arrangement_no_object_ms = now_ms
                 return build_event_packet(EVENT_ARRANGEMENT_NO_OBJECT)
 
@@ -2186,10 +2295,11 @@ class VisionSerialController:
                 self.mode == MODE_FINAL_ROI_TRACK
                 and not self._final_roi_sent
                 and self._latest_submit_ms > 0
-                and now_ms - self._last_no_target_ms
-                >= config.UART_NO_TARGET_REPEAT_MS
+                and self._latest_packet is None
+                and not self._final_search_waiting_ack
             ):
                 self._last_no_target_ms = now_ms
+                self._final_search_waiting_ack = True
                 return build_event_packet(EVENT_NO_TARGET)
         return None
 
