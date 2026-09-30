@@ -2,6 +2,8 @@
 
 from maix import image
 
+from zone_obstacle_region import zone_obstacle_polygon
+
 
 LABEL_COLORS = {
     "sqareblue": image.COLOR_BLUE,
@@ -16,27 +18,19 @@ SAFETY_ZONE_STYLES = {
     "bluesafety": ("BLUE SAFE", image.Color.from_rgb(0, 160, 255)),
     "redsafety": ("RED SAFE", image.Color.from_rgb(255, 40, 40)),
 }
-DEPRECATED_LABELS = {"blue safety"}
 BOX_THICKNESS = 2
 SAFETY_BOX_THICKNESS = 4
 SELECTED_BOX_THICKNESS = 4
 ROI_COLOR = image.Color.from_rgb(180, 0, 255)
 SELECTED_COLOR = image.Color.from_rgb(255, 220, 0)
-DEBUG_BOX_COLOR = image.Color.from_rgb(220, 220, 220)
-DEBUG_AREA_TEXT_COLOR = image.COLOR_BLACK
-DEBUG_AREA_TEXT_SCALE = 1.5
-DEBUG_AREA_TEXT_THICKNESS = 1
-DEBUG_X_GAP_COLOR = image.COLOR_BLACK
-DEBUG_X_GAP_LINE_THICKNESS = 1
-DEBUG_X_GAP_TEXT_SCALE = 1.5
-DEBUG_X_GAP_TEXT_THICKNESS = 1
-DEBUG_ABSOLUTE_Y_COLOR = image.COLOR_RED
-DEBUG_ABSOLUTE_Y_TEXT_SCALE = 1.5
-DEBUG_ABSOLUTE_Y_TEXT_THICKNESS = 1
-DEBUG_ABSOLUTE_Y_TOP = 36
-DEBUG_ABSOLUTE_Y_LINE_SPACING = 26
 ARRANGEMENT_SIDE_COLOR = image.COLOR_RED
 ARRANGEMENT_SIDE_THICKNESS = 3
+DEBUG_FINAL_CANDIDATE_COLOR = image.Color.from_rgb(175, 0, 235)
+DEBUG_FINAL_NEIGHBOR_COLOR = image.Color.from_rgb(255, 255, 255)
+DEBUG_FINAL_BOX_THICKNESS = 3
+DEBUG_TARGET_Y_COLOR = image.COLOR_RED
+DEBUG_TARGET_Y_TOP = 36
+DEBUG_YOLO_PADDING = 4
 
 
 def make_bottom_center_roi(frame_width, frame_height):
@@ -62,6 +56,28 @@ def object_center_in_roi(obj, roi_rect):
     return point_in_rect(center_x, center_y, roi_rect)
 
 
+def draw_debug_yolo_detections(img, objects, frame_width, frame_height):
+    """Draw all raw YOLO boxes as thin green outer borders, with no labels.
+
+    Padding keeps raw detection evidence visible beside yellow/purple/white
+    screening borders; no class, verification or safety-zone filter applies.
+    """
+    for obj in objects:
+        if float(obj.w) <= 0 or float(obj.h) <= 0:
+            continue
+        left = max(0, int(obj.x) - DEBUG_YOLO_PADDING)
+        top = max(0, int(obj.y) - DEBUG_YOLO_PADDING)
+        right = min(int(frame_width) - 1, int(obj.x + obj.w) + DEBUG_YOLO_PADDING - 1)
+        bottom = min(int(frame_height) - 1, int(obj.y + obj.h) + DEBUG_YOLO_PADDING - 1)
+        if left > right or top > bottom:
+            continue
+        img.draw_rect(
+            left, top, right - left + 1, bottom - top + 1,
+            color=image.COLOR_GREEN,
+            thickness=1,
+        )
+
+
 def draw_target_borders(img, objects, labels, roi_enabled, roi_rect):
     """Draw useful targets as borders only; do not draw labels or confidence."""
     for obj in objects:
@@ -80,138 +96,6 @@ def draw_target_borders(img, objects, labels, roi_enabled, roi_rect):
             obj.h,
             color=color,
             thickness=BOX_THICKNESS,
-        )
-
-
-def draw_debug_detections(img, objects, labels, selected_obj=None):
-    """Draw raw YOLO boxes without text, except the highlighted selection."""
-    for obj in objects:
-        if obj is selected_obj:
-            continue
-
-        class_id = int(obj.class_id)
-        if class_id < 0 or class_id >= len(labels):
-            label = "unknown"
-            color = DEBUG_BOX_COLOR
-        else:
-            label = labels[class_id]
-            if label in DEPRECATED_LABELS:
-                continue
-            color = LABEL_COLORS.get(label, DEBUG_BOX_COLOR)
-            safety_style = SAFETY_ZONE_STYLES.get(label)
-            if safety_style is not None:
-                color = safety_style[1]
-
-        img.draw_rect(
-            obj.x,
-            obj.y,
-            obj.w,
-            obj.h,
-            color=color,
-            thickness=BOX_THICKNESS,
-        )
-
-
-def draw_debug_safety_zone_areas(img, objects, labels, frame_width, frame_height):
-    """Show each safety-zone box area and its percentage of the frame."""
-    frame_width = int(frame_width)
-    frame_height = int(frame_height)
-    frame_area = max(1, frame_width * frame_height)
-
-    for obj in objects:
-        class_id = int(obj.class_id)
-        if class_id < 0 or class_id >= len(labels):
-            continue
-
-        style = SAFETY_ZONE_STYLES.get(labels[class_id])
-        if style is None:
-            continue
-
-        left = max(0, int(obj.x))
-        top = max(0, int(obj.y))
-        right = min(frame_width, int(obj.x + obj.w))
-        bottom = min(frame_height, int(obj.y + obj.h))
-        width = max(0, right - left)
-        height = max(0, bottom - top)
-        area = width * height
-        percentage = area * 100.0 / frame_area
-
-        text = "A={} {:.1f}%".format(area, percentage)
-        text_y = max(0, min(frame_height - 28, top))
-        img.draw_string(
-            left,
-            text_y,
-            text,
-            color=DEBUG_AREA_TEXT_COLOR,
-            scale=DEBUG_AREA_TEXT_SCALE,
-            thickness=DEBUG_AREA_TEXT_THICKNESS,
-        )
-
-
-def draw_debug_adjacent_coordinate_gaps(
-    img, objects, labels, frame_width, frame_height
-):
-    """Show center-X/Y differences between adjacent verified movable objects."""
-    frame_width = int(frame_width)
-    frame_height = int(frame_height)
-    centers = []
-
-    for obj in objects:
-        class_id = int(obj.class_id)
-        if class_id <= 0 or class_id >= len(labels):
-            continue
-        if labels[class_id] not in LABEL_COLORS:
-            continue
-
-        center_x = int(round(float(obj.x) + float(obj.w) * 0.5))
-        center_y = int(round(float(obj.y) + float(obj.h) * 0.5))
-        centers.append((center_x, center_y))
-
-    centers.sort(key=lambda center: (center[0], center[1]))
-    for left_center, right_center in zip(centers, centers[1:]):
-        left_x, left_y = left_center
-        right_x, right_y = right_center
-        delta_x = max(0, right_x - left_x)
-        delta_y = abs(right_y - left_y)
-
-        img.draw_line(
-            left_x,
-            left_y,
-            right_x,
-            right_y,
-            color=DEBUG_X_GAP_COLOR,
-            thickness=DEBUG_X_GAP_LINE_THICKNESS,
-        )
-
-        text = "dx={} dy={}".format(delta_x, delta_y)
-        text_x = max(0, min(frame_width - 150, (left_x + right_x) // 2 - 60))
-        text_y = max(0, min(frame_height - 28, (left_y + right_y) // 2 - 24))
-        img.draw_string(
-            text_x,
-            text_y,
-            text,
-            color=DEBUG_X_GAP_COLOR,
-            scale=DEBUG_X_GAP_TEXT_SCALE,
-            thickness=DEBUG_X_GAP_TEXT_THICKNESS,
-        )
-
-    # List absolute center-Y coordinates at the upper-right. The numbering is
-    # the same left-to-right order used for the adjacent dx/dy measurements.
-    text_x = max(0, frame_width - 120)
-    for index, (_, center_y) in enumerate(centers, start=1):
-        text_y = (
-            DEBUG_ABSOLUTE_Y_TOP
-            + (index - 1) * DEBUG_ABSOLUTE_Y_LINE_SPACING
-        )
-        if text_y > frame_height - 28:
-            break
-        img.draw_string(
-            text_x,
-            text_y,
-            "{}:y={}".format(index, center_y),
-            color=DEBUG_ABSOLUTE_Y_COLOR,
-            scale=DEBUG_ABSOLUTE_Y_TEXT_SCALE,
-            thickness=DEBUG_ABSOLUTE_Y_TEXT_THICKNESS,
         )
 
 
@@ -235,6 +119,76 @@ def draw_selected_target(img, obj, labels):
         color=SELECTED_COLOR,
         thickness=SELECTED_BOX_THICKNESS,
     )
+
+
+def draw_debug_final_candidates(img, candidates, neighbors, selected_obj):
+    """Show fallback target inputs in purple and all compared boxes in white."""
+    for obj in candidates:
+        if obj is selected_obj:
+            continue
+        img.draw_rect(
+            int(obj.x), int(obj.y), int(obj.w), int(obj.h),
+            color=DEBUG_FINAL_CANDIDATE_COLOR,
+            thickness=DEBUG_FINAL_BOX_THICKNESS,
+        )
+    # Draw neighbors last: a target can also be another target's neighbor,
+    # and every close box must remain visibly white in DEBUG.
+    for obj in neighbors:
+        img.draw_rect(
+            int(obj.x), int(obj.y), int(obj.w), int(obj.h),
+            color=DEBUG_FINAL_NEIGHBOR_COLOR,
+            thickness=DEBUG_FINAL_BOX_THICKNESS,
+        )
+
+
+def draw_debug_target_y(img, selected_obj, frame_width):
+    """Show the highlighted object's absolute center-Y in the upper-right."""
+    if selected_obj is None:
+        return
+    center_y = int(round(float(selected_obj.y) + float(selected_obj.h) * 0.5))
+    img.draw_string(
+        max(0, int(frame_width) - 112),
+        DEBUG_TARGET_Y_TOP,
+        "Y={}".format(center_y),
+        color=DEBUG_TARGET_Y_COLOR,
+        scale=1.5,
+        thickness=1,
+    )
+
+
+def draw_debug_neighbor_dx(img, dx_annotations, frame_width, frame_height):
+    """Show center-X gaps next to the white fallback-neighbor boxes."""
+    for obj, dx in dx_annotations:
+        text_x = max(0, min(int(frame_width) - 105, int(obj.x)))
+        text_y = max(0, min(int(frame_height) - 20, int(obj.y) - 19))
+        img.draw_string(
+            text_x,
+            text_y,
+            "dx={}".format(dx),
+            color=DEBUG_FINAL_NEIGHBOR_COLOR,
+            scale=1.2,
+            thickness=1,
+        )
+
+
+def draw_debug_candidate_y(
+    img, candidates, selected_obj, frame_width, frame_height
+):
+    """Show absolute center-Y beside each purple fallback target box."""
+    for obj in candidates:
+        if obj is selected_obj:
+            continue
+        center_y = int(round(float(obj.y) + float(obj.h) * 0.5))
+        text_x = max(0, min(int(frame_width) - 100, int(obj.x)))
+        text_y = max(0, min(int(frame_height) - 20, int(obj.y + obj.h) + 2))
+        img.draw_string(
+            text_x,
+            text_y,
+            "Y={}".format(center_y),
+            color=DEBUG_FINAL_CANDIDATE_COLOR,
+            scale=1.2,
+            thickness=1,
+        )
 
 
 def draw_arrangement_side_targets(img, objects):
@@ -284,6 +238,26 @@ def draw_safety_zones(img, objects, labels):
         )
 
 
+def draw_debug_frame_center(img, frame_width, frame_height):
+    """Mark the image center with a white cross outlined in black."""
+    center_x = int(frame_width) // 2
+    center_y = int(frame_height) // 2
+    for color, half_length, half_width in (
+        (image.COLOR_BLACK, 12, 3),
+        (DEBUG_FINAL_NEIGHBOR_COLOR, 10, 1),
+    ):
+        img.draw_rect(
+            center_x - half_length, center_y - half_width,
+            half_length * 2 + 1, half_width * 2 + 1,
+            color=color, thickness=half_width * 2 + 1,
+        )
+        img.draw_rect(
+            center_x - half_width, center_y - half_length,
+            half_width * 2 + 1, half_length * 2 + 1,
+            color=color, thickness=half_width * 2 + 1,
+        )
+
+
 def draw_roi_border(img, roi_rect):
     """Draw the ROI border without additional text."""
     img.draw_rect(
@@ -294,3 +268,17 @@ def draw_roi_border(img, roi_rect):
         color=ROI_COLOR,
         thickness=2,
     )
+
+
+def draw_debug_zone_obstacle_region(img, roi_rect, frame_width, frame_height):
+    """Outline the exact 06/16 obstacle-center trapezoid in red."""
+    polygon = zone_obstacle_polygon(roi_rect, frame_width, frame_height)
+    if polygon is None:
+        return
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        img.draw_line(
+            int(round(start[0])), int(round(start[1])),
+            int(round(end[0])), int(round(end[1])),
+            color=image.COLOR_RED, thickness=2,
+        )

@@ -47,19 +47,26 @@ VERIFY_TRIANGLE_DENSITY_MAX = 0.96
 UART_COORDINATE_ENABLED = True
 UART_PORT = "/dev/ttyS0"
 UART_BAUDRATE = 115200
-UART_SEND_RATE_HZ = 20
-UART_READ_POLL_MS = 5
+# 0: send each newly submitted coordinate result immediately, without a
+# fixed Hz cap. Positive values retain periodic coordinate publishing.
+UART_SEND_RATE_HZ = 0
+UART_READ_POLL_MS = 1
+# Diagnostics are independent of the screen DEBUG button. Changes/loss
+# boundaries report immediately; stable frames/coordinate writes are sampled.
+VISION_DIAGNOSTICS_ENABLED = True
+VISION_DIAGNOSTICS_INTERVAL_MS = 500
+VISION_DIAGNOSTICS_MAX_OBJECTS = 24
+# Preserve spacing between queued command events so MCU's single event slot
+# can consume each handshake; coordinates do not use this limit.
+UART_EVENT_MIN_INTERVAL_MS = 50
 UART_TARGET_FRESHNESS_MS = 200
 UART_NO_TARGET_REPEAT_MS = 500
 # State 03 must miss its selected target for this many consecutive frames
 # before reporting E3, preventing one-frame detection flicker from triggering it.
 UART_SEARCH_NO_TARGET_FRAMES = 5
-# Repeat event 34 while state 24 is waiting for the MCU's 15/25 command.
+UART_FINAL_NO_TARGET_FRAMES = 10
+# Repeat event 34 while the state-24 target center remains inside the ROI.
 UART_FINAL_ROI_EVENT_REPEAT_MS = 500
-# Repeat arrangement event 02 until MCU acknowledges it with command 12.
-UART_ARRANGE_02_REPEAT_MS = 500
-# After MCU command 14, skip arrangement if no valid 02 decision is possible.
-UART_PRE_02_DECISION_TIMEOUT_MS = 2500
 UART_DEFAULT_MODE = 0x03
 UART_MAX_X_JUMP_PX = 100
 UART_MAX_Y_JUMP_PX = 100
@@ -68,26 +75,38 @@ UART_X_JUMP_RESET_MS = 500
 # State 04 aligns the selected object with the image center before event 14.
 UART_FRAME_CENTER_TOLERANCE_X = 20
 UART_FRAME_CENTER_TOLERANCE_Y = 20
-# State 24 must align the selected object's center with the ROI center before
-# event 34; merely entering the large full-width ROI is not sufficient.
+# Hold the 03->04 target identity through short misses, without reusing old
+# coordinates. Confirm an actual loss/E4 only after this many fresh misses.
+UART_TRACK_LOST_CONFIRM_FRAMES = 5
+# These tolerances are used by state 04's event 14. State 24's event 34
+# checks entry into the entire tracking ROI, not center-point alignment.
 UART_FINAL_ROI_CENTER_TOLERANCE_X = 20
 UART_FINAL_ROI_CENTER_TOLERANCE_Y = 20
-# State-24 primary target spacing rules use absolute box-center Y and the
-# nearest movable object's box-center dx/dy. Threshold comparisons are strict.
-UART_FINAL_PRIMARY_MAX_DY = 30
-UART_FINAL_PRIMARY_MIN_DX_Y_GT_290 = 200
+# Shared tracking spacing rules use absolute box-center Y to select the X
+# threshold. Every movable neighbor must lie outside that X threshold;
+# a distant object's Y difference never disqualifies an isolated target.
+UART_FINAL_PRIMARY_MIN_DX_Y_GT_290 = 170
 UART_FINAL_PRIMARY_MIN_DX_Y_GT_220 = 150
 UART_FINAL_PRIMARY_MIN_DX_Y_GT_150 = 120
 UART_FINAL_PRIMARY_MIN_DX_Y_GT_100 = 90
 UART_FINAL_PRIMARY_MIN_DX_Y_GT_90 = 70
 UART_FINAL_PRIMARY_MIN_DX_Y_LE_90 = 60
+# Use these red-specific dx limits when either box in a pair is red.
+UART_FINAL_RED_MIN_DX_Y_GT_290 = 240
+UART_FINAL_RED_MIN_DX_Y_GT_220 = 170
+UART_FINAL_RED_MIN_DX_Y_GT_150 = 150
+UART_FINAL_RED_MIN_DX_Y_GT_100 = 120
+UART_FINAL_RED_MIN_DX_Y_GT_90 = 70
+UART_FINAL_RED_MIN_DX_Y_LE_90 = 110
+# Multi-object DEBUG choices need confirmation; a lone valid target is
+# highlighted immediately, without this delay.
+DEBUG_SECONDARY_CLEAR_FRAMES = 3
 # Arrangement states 02/12 only identify side objects and drive event/state
 # decisions. Their MCU movement is timed/open-loop; no coordinate packet is sent.
 UART_ARRANGE_MAX_Y_DIFFERENCE = 80
 # In arrangement state 02, ignore side objects whose center is horizontally
 # more than 200 pixels from the locked middle object.
 UART_ARRANGE_02_MAX_X_DIFFERENCE = 200
-UART_ARRANGE_NO_NEIGHBOR_FRAMES = 5
 UART_ARRANGE_DEBUG_PRINT_MS = 500
 # After event 05, allow the MCU-operated camera mechanism to reach its near
 # position, then require a stable full-frame object count before deciding.
@@ -103,9 +122,11 @@ UART_ZONE_CASUALTY_LABEL = "sqarered"
 # Aim 3/8 of the safety-zone width inward from the right boundary.
 UART_ZONE_CASUALTY_X_RATIO = 0.625
 UART_ZONE_SUPPLY_X_RATIO = 0.25
-# Safety-zone approach: 20 px outside / 10 px inside the ROI top edge.
-UART_ZONE_OBSTACLE_EDGE_OUTSIDE_PX = 20
-UART_ZONE_OBSTACLE_EDGE_INSIDE_PX = 10
+# Safety-zone approach: narrow front edge centered on the image midline;
+# rear edge retains the ROI width, 20 px inside its top edge.
+UART_ZONE_OBSTACLE_FRONT_WIDTH_PX = 100
+UART_ZONE_OBSTACLE_FRONT_Y = 100
+UART_ZONE_OBSTACLE_EDGE_INSIDE_PX = 20
 UART_ZONE_OBSTACLE_CONFIRM_FRAMES = 3
 UART_ZONE_OBSTACLE_CLEAR_FRAMES = 3
 UART_ZONE_OBSTACLE_REPEAT_MS = 500

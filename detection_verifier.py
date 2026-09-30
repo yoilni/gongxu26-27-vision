@@ -37,14 +37,35 @@ class DetectionVerifier:
         self._debug_color_passed = 0
         self._debug_confirmed = 0
         self._debug_latest = {}
+        self._frame_diagnostics = []
 
     def process(self, img, objects, labels, debug_enabled=False):
         """Return only current-frame objects that pass all confirmation stages."""
+        self._frame_diagnostics = []
         if not config.VERIFY_ENABLED:
+            if config.VISION_DIAGNOSTICS_ENABLED:
+                self._frame_diagnostics = [
+                    {"obj": obj, "status": "verification_disabled"} for obj in objects
+                ]
             return objects
 
         self._frame_index += 1
         candidates = self._select_candidates(objects, labels)
+        diagnostic_records = {}
+        if config.VISION_DIAGNOSTICS_ENABLED:
+            checked_ids = {id(obj) for obj, _ in candidates}
+            for obj in objects:
+                class_id = int(obj.class_id)
+                label = labels[class_id] if 0 <= class_id < len(labels) else None
+                record = {
+                    "obj": obj,
+                    "status": "pending" if id(obj) in checked_ids else (
+                        "class_candidate_limit" if label in USEFUL_LABELS
+                        else "not_movable_class"
+                    ),
+                }
+                self._frame_diagnostics.append(record)
+                diagnostic_records[id(obj)] = record
         frame_groups = {}
         confirmed_objects = []
 
@@ -96,10 +117,28 @@ class DetectionVerifier:
                 if state["confirmed"] and current_evidence:
                     confirmed_objects.append(obj)
                     self._debug_confirmed += 1
+                if id(obj) in diagnostic_records:
+                    record = diagnostic_records[id(obj)]
+                    record.update(metrics)
+                    record["status"] = (
+                        "pass" if state["confirmed"] and current_evidence
+                        else "wait_temporal" if not state["confirmed"]
+                        else "current_evidence_rejected"
+                    )
+                    record["current_evidence"] = current_evidence
+                    record["high_conf_bypass"] = (
+                        not metrics["ok"] and float(getattr(obj, "score", 0))
+                        >= config.VERIFY_HIGH_CONFIDENCE_BYPASS
+                    )
+                    record["confirmed"] = state["confirmed"]
 
         self._age_class_states(frame_groups)
         self._report_debug(debug_enabled)
         return confirmed_objects
+
+    def frame_diagnostics(self):
+        """Current-frame evidence only, for logs; never used for selection."""
+        return self._frame_diagnostics
 
     @staticmethod
     def _select_candidates(objects, labels):
@@ -135,20 +174,25 @@ class DetectionVerifier:
             "density": 0.0,
             "hits": 0,
             "evidence": 0,
+            "reason": "invalid_roi",
         }
         if roi is None:
             return False, metrics
 
         aspect = roi[2] / float(max(1, roi[3]))
+        metrics["aspect"] = aspect
+        metrics["roi"] = roi
         if label != LABEL_BLACK_TRIANGLE and not (
             config.VERIFY_SQUARE_ASPECT_MIN
             <= aspect
             <= config.VERIFY_SQUARE_ASPECT_MAX
         ):
+            metrics["reason"] = "aspect_rejected"
             return False, metrics
 
         if not self._color_available:
             metrics["ok"] = True
+            metrics["reason"] = "color_api_unavailable"
             return True, metrics
 
         try:
@@ -163,9 +207,11 @@ class DetectionVerifier:
                 )
                 self._color_error_reported = True
             metrics["ok"] = True
+            metrics["reason"] = "color_api_fallback"
             return True, metrics
 
         metrics["ok"] = passed
+        metrics["reason"] = "color_shape_pass" if passed else "color_shape_rejected"
         return passed, metrics
 
     def _validate_color(self, img, roi, label, metrics):
@@ -173,18 +219,21 @@ class DetectionVerifier:
             color = self._blob_metrics(img, roi, [config.VERIFY_LAB_BLUE])
             metrics["blue"] = color["ratios"][0]
             metrics["density"] = color["largest_density"]
+            metrics["largest_blob_ratio"] = color["largest_ratio"]
             return self._single_color_passed(color)
 
         if label == LABEL_RED:
             color = self._blob_metrics(img, roi, [config.VERIFY_LAB_RED])
             metrics["red"] = color["ratios"][0]
             metrics["density"] = color["largest_density"]
+            metrics["largest_blob_ratio"] = color["largest_ratio"]
             return self._single_color_passed(color)
 
         if label == LABEL_GREEN:
             color = self._blob_metrics(img, roi, [config.VERIFY_LAB_GREEN])
             metrics["green"] = color["ratios"][0]
             metrics["density"] = color["largest_density"]
+            metrics["largest_blob_ratio"] = color["largest_ratio"]
             return self._single_color_passed(color)
 
         color = self._blob_metrics(img, roi, [config.VERIFY_LAB_BLACK])

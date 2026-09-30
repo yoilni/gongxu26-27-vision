@@ -1,17 +1,26 @@
 id: r2
-name: gongxunV927
+name: gongxunV930
 version: 1.0.9
 author: '1'
 icon: ''
 desc: '1'
 files:
+  - AGENTS.md
   - app_config.py
+  - app.yaml
   - code_scanner.py
+  - coordinate_sender.py
+  - debug_target_preview.py
   - detection_verifier.py
+  - DIAGNOSTICS.md
   - main.py
   - media_control.py
   - menu_ui.py
   - performance_debug.py
   - serial_controller.py
   - target_selector.py
+  - test_qrcode.png
+  - test_vision_rules.py
+  - vision_diagnostics.py
   - vision_overlay.py
+  - zone_obstacle_region.py

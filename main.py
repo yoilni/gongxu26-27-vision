@@ -6,6 +6,7 @@ from maix import app, camera, display, image, nn, touchscreen
 
 import app_config as config
 from code_scanner import CodeScanner
+from debug_target_preview import DebugTargetPreview
 from detection_verifier import DetectionVerifier
 from media_control import MediaController
 from menu_ui import (
@@ -22,9 +23,13 @@ from performance_debug import PerformanceProfiler
 from serial_controller import VisionSerialController
 from vision_overlay import (
     draw_arrangement_side_targets,
-    draw_debug_adjacent_coordinate_gaps,
-    draw_debug_detections,
-    draw_debug_safety_zone_areas,
+    draw_debug_frame_center,
+    draw_debug_final_candidates,
+    draw_debug_candidate_y,
+    draw_debug_neighbor_dx,
+    draw_debug_target_y,
+    draw_debug_yolo_detections,
+    draw_debug_zone_obstacle_region,
     draw_roi_border,
     draw_safety_zones,
     draw_selected_target,
@@ -49,7 +54,7 @@ def configure_camera(detector):
 def main():
     os.makedirs(config.RECORD_DIR, exist_ok=True)
 
-    detector = nn.YOLO26(model=config.MODEL_PATH, dual_buff=True)
+    detector = nn.YOLO26(model=config.MODEL_PATH, dual_buff=False)
     cam = configure_camera(detector)
     disp = display.Display()
     touch = touchscreen.TouchScreen()
@@ -71,6 +76,10 @@ def main():
         detector.input_height(),
         tracking_roi=roi_rect,
     )
+    debug_preview = DebugTargetPreview(
+        detector.input_height(), tracking_roi=roi_rect
+    )
+    print("Vision DEBUG preview=raw_yolo_green_outer_single_yellow_v11")
 
     roi_enabled = False
     last_pressed = False
@@ -102,6 +111,7 @@ def main():
                 verified_objects,
                 detector.labels,
                 raw_objects=objects,
+                verification_diagnostics=verifier.frame_diagnostics(),
             )
             arrangement_side_objects = (
                 serial_controller.arrangement_side_objects(
@@ -115,37 +125,62 @@ def main():
             scanner.process(img)
             stage_start_us = profiler.mark("scan", stage_start_us)
 
-            # Safety zones do not need the color/temporal verifier used by the
-            # four movable targets, so draw them from the raw YOLO results.
+            # DEBUG previews raw YOLO spacing, then nearest ROI-center Y.
+            # UART independently receives only verified objects above.
+            # Ordinary mode still draws safety zones from raw YOLO results.
             if profiler.enabled:
-                draw_debug_detections(
-                    img,
-                    objects,
-                    detector.labels,
-                    selected_obj=selected_target,
+                draw_debug_yolo_detections(
+                    img, objects, detector.input_width(), detector.input_height()
                 )
-                draw_debug_safety_zone_areas(
-                    img,
-                    objects,
-                    detector.labels,
-                    detector.input_width(),
-                    detector.input_height(),
+                (
+                    final_candidates,
+                    final_neighbors,
+                    debug_selected,
+                    neighbor_dx,
+                ) = (
+                    debug_preview.select(
+                        verified_objects,
+                        detector.labels,
+                        objects,
+                        serial_controller.target_label,
+                    )
                 )
-                draw_debug_adjacent_coordinate_gaps(
-                    img,
-                    verified_objects,
-                    detector.labels,
-                    detector.input_width(),
-                    detector.input_height(),
+                draw_debug_final_candidates(
+                    img, final_candidates, final_neighbors, debug_selected
+                )
+                draw_debug_neighbor_dx(
+                    img, neighbor_dx,
+                    detector.input_width(), detector.input_height(),
+                )
+                draw_debug_candidate_y(
+                    img, final_candidates, debug_selected,
+                    detector.input_width(), detector.input_height(),
                 )
             else:
                 draw_safety_zones(img, objects, detector.labels)
-            draw_selected_target(img, selected_target, detector.labels)
+            draw_selected_target(
+                img,
+                debug_selected if profiler.enabled else selected_target,
+                detector.labels,
+            )
+            if profiler.enabled:
+                draw_debug_target_y(
+                    img, debug_selected, detector.input_width()
+                )
             # Keep every accepted non-middle object red in ARRANGE-02, including
             # the currently selected side object (do not let yellow cover it).
-            draw_arrangement_side_targets(img, arrangement_side_objects)
+            if not profiler.enabled:
+                draw_arrangement_side_targets(img, arrangement_side_objects)
             if roi_enabled or profiler.enabled:
                 draw_roi_border(img, roi_rect)
+            if profiler.enabled:
+                draw_debug_zone_obstacle_region(
+                    img, roi_rect,
+                    detector.input_width(), detector.input_height(),
+                )
+                draw_debug_frame_center(
+                    img, detector.input_width(), detector.input_height()
+                )
             stage_start_us = profiler.mark("draw", stage_start_us)
 
             touch_x, touch_y, pressed = touch.read()
@@ -165,6 +200,7 @@ def main():
                     requested_action = None
                 elif requested_action == ACTION_DEBUG:
                     profiler.toggle()
+                    debug_preview.reset()
                     requested_action = None
             last_pressed = pressed
 

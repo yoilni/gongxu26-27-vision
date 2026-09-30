@@ -52,6 +52,7 @@ def select_nearest_horizontal_target(
     reference_x=None,
     reference_y=None,
     vertical_first=False,
+    horizontal_first=False,
 ):
     """Return the target nearest to the supplied reference.
 
@@ -60,8 +61,9 @@ def select_nearest_horizontal_target(
     are ignored. When ``reference_y`` is supplied, squared X/Y distance is
     used; otherwise selection remains X-only. When ``vertical_first`` is true,
     absolute Y distance is the primary key and absolute X distance is the
-    secondary key. Confidence breaks equal-distance ties. The horizontal frame
-    center is the default X reference.
+    secondary key. ``horizontal_first`` reverses that priority. Confidence
+    breaks equal-distance ties. The horizontal frame center is the default X
+    reference.
     """
     if target_label is not None and target_label not in TARGET_LABELS:
         return None
@@ -94,6 +96,12 @@ def select_nearest_horizontal_target(
                 candidate_key = (
                     vertical_error,
                     horizontal_error,
+                    -confidence,
+                )
+            elif horizontal_first:
+                candidate_key = (
+                    horizontal_error,
+                    vertical_error,
                     -confidence,
                 )
             else:
