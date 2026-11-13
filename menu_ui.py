@@ -1,6 +1,6 @@
 """On-screen menu rendering and touch routing."""
 
-from maix import image
+from maix import image, time
 
 import app_config as config
 
@@ -10,6 +10,7 @@ ACTION_AUDIO = "audio"
 ACTION_ROI = "roi"
 ACTION_SCAN = "scan"
 ACTION_DEBUG = "debug"
+ACTION_PHOTO = "photo"
 ACTION_RTSP = "rtsp"
 ACTION_WEBRTC = "webrtc"
 
@@ -34,6 +35,11 @@ class MenuUI:
         self.page = PAGE_MAIN
         self.chinese_font_ready = self._load_chinese_font()
         self._button_cache = {}
+        self._fps_label = None
+        self._fallback_fps_start_us = None
+        self._fallback_fps_frames = 0
+        self._fallback_fps = None
+        self._fps_interval_us = max(1, int(getattr(config, "DEBUG_SCREEN_FPS_INTERVAL_US", 500_000)))
         self._create_layout()
 
     def _load_chinese_font(self):
@@ -66,6 +72,13 @@ class MenuUI:
             top_width,
             top_height,
         ]
+        self.photo_rect = [BUTTON_MARGIN, BUTTON_MARGIN,
+                           min(144, width - 2 * BUTTON_MARGIN),
+                           min(60, height - 2 * BUTTON_MARGIN)]
+        self.photo_touch_rect = self._map_to_touch(self.photo_rect)
+        # In DEBUG, reserve the upper-left corner for the larger PHOTO button.
+        self.debug_back_rect = list(self.menu_rect)
+        self.debug_back_touch_rect = self._map_to_touch(self.debug_back_rect)
         option_count = 6
         option_area_height = (
             option_count * option_height
@@ -132,15 +145,18 @@ class MenuUI:
         left, top, width, height = rect
         return left <= x < left + width and top <= y < top + height
 
-    def handle_release(self, touch_x, touch_y):
+    def handle_release(self, touch_x, touch_y, debug_enabled=False):
         """Update the current page and return a requested action, if any."""
+        back_touch_rect = self.debug_back_touch_rect if debug_enabled else self.back_touch_rect
+        if debug_enabled and self._point_in_rect(touch_x, touch_y, self.photo_touch_rect):
+            return ACTION_PHOTO
         if self.page == PAGE_MAIN:
             if self._point_in_rect(touch_x, touch_y, self.menu_touch_rect):
                 self.page = PAGE_MENU
             return None
 
         if self.page == PAGE_MENU:
-            if self._point_in_rect(touch_x, touch_y, self.back_touch_rect):
+            if self._point_in_rect(touch_x, touch_y, back_touch_rect):
                 self.page = PAGE_MAIN
             elif self._point_in_rect(touch_x, touch_y, self.stream_touch_rect):
                 self.page = PAGE_STREAM
@@ -156,7 +172,7 @@ class MenuUI:
                 return ACTION_DEBUG
             return None
 
-        if self._point_in_rect(touch_x, touch_y, self.back_touch_rect):
+        if self._point_in_rect(touch_x, touch_y, back_touch_rect):
             self.page = PAGE_MENU
         elif self._point_in_rect(touch_x, touch_y, self.rtsp_touch_rect):
             return ACTION_RTSP
@@ -202,6 +218,45 @@ class MenuUI:
     def _label(self, chinese, english):
         return chinese if self.chinese_font_ready else english
 
+    def _resolve_debug_fps(self, debug_enabled, fps):
+        # Prefer the completed-loop profiler. Older main.py versions omit the
+        # argument; time consecutive rendered frames locally in that case so
+        # their default None cannot leave the HUD at "--" indefinitely.
+        # Neither counter depends on YOLO results or its dual-buffer mode.
+        if not debug_enabled or fps is not None:
+            self._fallback_fps_start_us = None
+            self._fallback_fps_frames = 0
+            self._fallback_fps = None
+            return fps
+        now_us = time.ticks_us()
+        if self._fallback_fps_start_us is None:
+            self._fallback_fps_start_us = now_us
+        else:
+            self._fallback_fps_frames += 1
+            elapsed_us = now_us - self._fallback_fps_start_us
+            if elapsed_us >= self._fps_interval_us:
+                self._fallback_fps = self._fallback_fps_frames * 1_000_000.0 / max(1, elapsed_us)
+                self._fallback_fps_frames = 0
+                self._fallback_fps_start_us = now_us
+        return self._fallback_fps
+
+    def _draw_debug_fps(self, img, fps):
+        text = "FPS: --" if fps is None else "FPS: {:.1f}".format(fps)
+        # Cache only the latest text layout, never an unbounded entry for every
+        # FPS value. Draw on each fresh image; the number updates every500ms.
+        if self._fps_label is None or self._fps_label[2] != text:
+            scale = 1.5
+            try:
+                text_width = int(image.string_size(text).width() * scale + .5)
+            except (AttributeError, TypeError):
+                text_width = int(len(text) * 8 * scale)
+            right_margin = max(BUTTON_MARGIN, int(getattr(config, "DEBUG_SCREEN_FPS_RIGHT_MARGIN_PX", 30)))
+            text_x = max(0, self.frame_width - right_margin - text_width)
+            text_y = self.debug_back_rect[1] + self.debug_back_rect[3] + BUTTON_MARGIN * 2
+            self._fps_label = (text_x, text_y, text)
+        text_x, text_y, text = self._fps_label
+        img.draw_string(text_x, text_y, text, color=image.COLOR_BLACK, scale=1.5, thickness=1)
+
     def draw(
         self,
         img,
@@ -211,7 +266,10 @@ class MenuUI:
         roi_enabled,
         scan_enabled,
         debug_enabled,
+        photo_status="",
+        debug_fps=None,
     ):
+        back_rect = self.debug_back_rect if debug_enabled else self.back_rect
         if self.page == PAGE_MAIN:
             menu_color = (
                 BUTTON_COLOR_STOP
@@ -227,7 +285,7 @@ class MenuUI:
         elif self.page == PAGE_MENU:
             self._draw_button(
                 img,
-                self.back_rect,
+                back_rect,
                 self._label("返回", "BACK"),
                 BUTTON_COLOR_BACK,
             )
@@ -286,7 +344,7 @@ class MenuUI:
         else:
             self._draw_button(
                 img,
-                self.back_rect,
+                back_rect,
                 self._label("返回", "BACK"),
                 BUTTON_COLOR_BACK,
             )
@@ -313,6 +371,9 @@ class MenuUI:
                 if active_protocol == config.PROTOCOL_WEBRTC
                 else BUTTON_COLOR_START,
             )
+
+        if debug_enabled:
+            self._draw_button(img, self.photo_rect, self._label("拍照", "PHOTO"), BUTTON_COLOR_START)
 
         if recording:
             indicator_y = self.frame_height - 14

@@ -1,6 +1,7 @@
 """DEBUG-only target visualization; never changes the UART tracking state."""
 
 import app_config as config
+from target_selector import spacing_neighbor_in_y_scope
 
 
 MOVABLE_LABELS = {
@@ -56,6 +57,7 @@ class DebugTargetPreview:
     """Show isolated targets immediately; confirm multi-object choices."""
 
     def __init__(self, frame_height=448, tracking_roi=None):
+        self._frame_center_y = float(frame_height) * 0.5
         self._reference_y = (
             float(tracking_roi[1]) + float(tracking_roi[3]) * 0.5
             if tracking_roi is not None else float(frame_height) * 0.5
@@ -122,7 +124,11 @@ class DebugTargetPreview:
             for other in movable:
                 if other is candidate:
                     continue
-                other_x, _ = _center(other)
+                other_x, other_y = _center(other)
+                if not spacing_neighbor_in_y_scope(
+                    candidate.class_id, center_y, other_y, self._frame_center_y
+                ):
+                    continue
                 dx = abs(other_x - center_x)
                 red_pair = (
                     int(candidate.class_id) == 4

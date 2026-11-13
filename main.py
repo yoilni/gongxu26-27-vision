@@ -2,16 +2,23 @@
 
 import os
 
+# Disable IDE image transport before Maix initializes the display channel.
+# Local screen output through disp.show() remains enabled.
+os.environ["MAIXVISION"] = "0"
+
 from maix import app, camera, display, image, nn, touchscreen
 
 import app_config as config
 from code_scanner import CodeScanner
-from debug_target_preview import DebugTargetPreview
+from detection_confidence import DetectionConfidenceFilter
 from detection_verifier import DetectionVerifier
+from dataset_capture import DatasetCapture
 from media_control import MediaController
+from model_class_mapping import ModelClassMapper
 from menu_ui import (
     ACTION_AUDIO,
     ACTION_DEBUG,
+    ACTION_PHOTO,
     ACTION_RECORD,
     ACTION_ROI,
     ACTION_RTSP,
@@ -20,16 +27,11 @@ from menu_ui import (
     MenuUI,
 )
 from performance_debug import PerformanceProfiler
-from serial_controller import VisionSerialController
+from serial_controller import MODE_FINAL_ROI_TRACK, VisionSerialController
+from tracking_roi import near_view_roi_vertices
 from vision_overlay import (
     draw_arrangement_side_targets,
-    draw_debug_frame_center,
-    draw_debug_final_candidates,
-    draw_debug_candidate_y,
-    draw_debug_neighbor_dx,
-    draw_debug_target_y,
     draw_debug_yolo_detections,
-    draw_debug_zone_obstacle_region,
     draw_roi_border,
     draw_safety_zones,
     draw_selected_target,
@@ -54,140 +56,144 @@ def configure_camera(detector):
 def main():
     os.makedirs(config.RECORD_DIR, exist_ok=True)
 
-    detector = nn.YOLO26(model=config.MODEL_PATH, dual_buff=False)
+    detector = nn.YOLO26(
+        model=config.MODEL_PATH,
+        dual_buff=getattr(config, "DETECT_DUAL_BUFFER", True),
+    )
+    frame_width = detector.input_width()
+    frame_height = detector.input_height()
+    model_labels = detector.labels
+    class_mapper = ModelClassMapper(model_labels)
+    labels = class_mapper.labels
+    print("Vision model_classes=" + class_mapper.summary() + " black_uart_id=6")
+    confidence_filter = DetectionConfidenceFilter(
+        config.DETECT_CONFIDENCE,
+        getattr(config, "DETECT_BLACK_CONFIDENCE", 0.7),
+        getattr(config, "DETECT_SAFETY_ZONE_CONFIDENCE", 0.4),
+    )
+    print("Vision confidence default={} black={} safety={} detector_floor={}".format(
+        config.DETECT_CONFIDENCE,
+        getattr(config, "DETECT_BLACK_CONFIDENCE", 0.7),
+        getattr(config, "DETECT_SAFETY_ZONE_CONFIDENCE", 0.4),
+        confidence_filter.detector_threshold,
+    ))
     cam = configure_camera(detector)
     disp = display.Display()
     touch = touchscreen.TouchScreen()
 
-    menu = MenuUI(detector.input_width(), detector.input_height(), disp)
+    menu = MenuUI(frame_width, frame_height, disp)
     media = MediaController(cam)
-    scanner = CodeScanner(detector.input_width(), detector.input_height())
+    scanner = CodeScanner(frame_width, frame_height)
     verifier = DetectionVerifier(
-        detector.input_width(),
-        detector.input_height(),
+        frame_width,
+        frame_height,
     )
     profiler = PerformanceProfiler()
     roi_rect = make_bottom_center_roi(
-        detector.input_width(),
-        detector.input_height(),
+        frame_width,
+        frame_height,
     )
+    near_view_roi = near_view_roi_vertices(frame_width, frame_height)
     serial_controller = VisionSerialController(
-        detector.input_width(),
-        detector.input_height(),
+        frame_width,
+        frame_height,
         tracking_roi=roi_rect,
+        near_view_roi=near_view_roi,
+        claw_geometry=True,
     )
-    debug_preview = DebugTargetPreview(
-        detector.input_height(), tracking_roi=roi_rect
-    )
-    print("Vision DEBUG preview=raw_yolo_green_outer_single_yellow_v11")
+    print("Vision DEBUG preview=all_class_color_boxes_labels_confidence_v1 photo_annotated_v1 roi_base_inset_v1 no_hud_v1 zone_line_preview_removed_v8")
 
     roi_enabled = False
     last_pressed = False
+    dataset_capture = DatasetCapture(
+        getattr(config, "DATASET_CAPTURE_ROOT", "/root/sd")
+    )
+    verifier_task_reset_epoch = 0
 
     try:
         while not app.need_exit():
             frame_start_us = profiler.begin_frame()
             stage_start_us = frame_start_us
 
+            frame_generation, task_reset_epoch = serial_controller.frame_context()
+            if task_reset_epoch != verifier_task_reset_epoch:
+                # Only FE clears confirmation history, not normal stage ACKs.
+                verifier.reset_task_history()
+                verifier_task_reset_epoch = task_reset_epoch
             img = cam.read()
             stage_start_us = profiler.mark("camera", stage_start_us)
 
             objects = detector.detect(
                 img,
-                conf_th=config.DETECT_CONFIDENCE,
+                conf_th=confidence_filter.detector_threshold,
                 iou_th=config.DETECT_IOU,
             )
+            blackbar_objects = confidence_filter.apply_blackbars(class_mapper.blackbars(objects))
+            # Independent auxiliary channel: normal03/04/24 needs startzone
+            # for AE, but class8 never enters cargo verification/counting.
+            startzone_objects = confidence_filter.apply_startzones(class_mapper.startzones(objects))
+            # Normalize by model LABEL before every consumer. New model0 is
+            # bluesafety,3 is sqaregreen,5 is ignored startzone; old layouts
+            # remain supported without leaking model indices into UART IDs.
+            objects = class_mapper.normalize(objects)
+            objects = confidence_filter.apply(objects)
             stage_start_us = profiler.mark("yolo", stage_start_us)
 
             verified_objects = verifier.process(
                 img,
                 objects,
-                detector.labels,
+                labels,
                 debug_enabled=profiler.enabled,
             )
             stage_start_us = profiler.mark("verify", stage_start_us)
 
             selected_target = serial_controller.submit(
                 verified_objects,
-                detector.labels,
+                labels,
                 raw_objects=objects,
                 verification_diagnostics=verifier.frame_diagnostics(),
+                frame_generation=frame_generation,
+                blackbar_objects=blackbar_objects,
+                startzone_objects=startzone_objects,
             )
-            arrangement_side_objects = (
+            arrangement_side_objects = [] if profiler.enabled else (
                 serial_controller.arrangement_side_objects(
                     verified_objects,
-                    detector.labels,
+                    labels,
                     raw_objects=objects,
                 )
             )
             stage_start_us = profiler.mark("serial", stage_start_us)
 
-            scanner.process(img)
+            if not profiler.enabled:
+                scanner.process(img)
             stage_start_us = profiler.mark("scan", stage_start_us)
 
-            # DEBUG previews raw YOLO spacing, then nearest ROI-center Y.
-            # UART independently receives only verified objects above.
-            # Ordinary mode still draws safety zones from raw YOLO results.
             if profiler.enabled:
                 draw_debug_yolo_detections(
-                    img, objects, detector.input_width(), detector.input_height()
+                    img, list(objects) + blackbar_objects + startzone_objects,
+                    frame_width, frame_height, labels=model_labels,
                 )
-                (
-                    final_candidates,
-                    final_neighbors,
-                    debug_selected,
-                    neighbor_dx,
-                ) = (
-                    debug_preview.select(
-                        verified_objects,
-                        detector.labels,
-                        objects,
-                        serial_controller.target_label,
-                    )
-                )
-                draw_debug_final_candidates(
-                    img, final_candidates, final_neighbors, debug_selected
-                )
-                draw_debug_neighbor_dx(
-                    img, neighbor_dx,
-                    detector.input_width(), detector.input_height(),
-                )
-                draw_debug_candidate_y(
-                    img, final_candidates, debug_selected,
-                    detector.input_width(), detector.input_height(),
-                )
-            else:
-                draw_safety_zones(img, objects, detector.labels)
-            draw_selected_target(
-                img,
-                debug_selected if profiler.enabled else selected_target,
-                detector.labels,
-            )
-            if profiler.enabled:
-                draw_debug_target_y(
-                    img, debug_selected, detector.input_width()
+            elif not profiler.enabled:
+                draw_safety_zones(img, objects, labels)
+                draw_selected_target(
+                    img, selected_target, labels, frame_width, frame_height
                 )
             # Keep every accepted non-middle object red in ARRANGE-02, including
             # the currently selected side object (do not let yellow cover it).
             if not profiler.enabled:
                 draw_arrangement_side_targets(img, arrangement_side_objects)
             if roi_enabled or profiler.enabled:
-                draw_roi_border(img, roi_rect)
-            if profiler.enabled:
-                draw_debug_zone_obstacle_region(
-                    img, roi_rect,
-                    detector.input_width(), detector.input_height(),
-                )
-                draw_debug_frame_center(
-                    img, detector.input_width(), detector.input_height()
-                )
+                draw_roi_border(img, roi_rect, show_reticle=profiler.enabled,
+                                near_view_roi=near_view_roi,
+                                final_track=serial_controller.mode == MODE_FINAL_ROI_TRACK)
             stage_start_us = profiler.mark("draw", stage_start_us)
 
             touch_x, touch_y, pressed = touch.read()
             released = last_pressed != pressed and not pressed
             requested_action = None
             if released:
-                requested_action = menu.handle_release(touch_x, touch_y)
+                requested_action = menu.handle_release(touch_x, touch_y, profiler.enabled)
                 if requested_action == ACTION_AUDIO:
                     media.toggle_audio_option()
                     requested_action = None
@@ -200,7 +206,10 @@ def main():
                     requested_action = None
                 elif requested_action == ACTION_DEBUG:
                     profiler.toggle()
-                    debug_preview.reset()
+                    requested_action = None
+                elif requested_action == ACTION_PHOTO:
+                    # Save this annotated frame, before buttons/status cover it.
+                    dataset_capture.save(img)
                     requested_action = None
             last_pressed = pressed
 
@@ -212,6 +221,8 @@ def main():
                 roi_enabled,
                 scanner.enabled,
                 profiler.enabled,
+                dataset_capture.status,
+                debug_fps=profiler.fps,
             )
             stage_start_us = profiler.mark("ui", stage_start_us)
 

@@ -1,4 +1,4 @@
-"""Class-specific color checks and temporal confirmation for YOLO results."""
+"""Geometry/temporal confirmation with optional LAB checks for YOLO results."""
 
 from maix import time
 
@@ -19,7 +19,7 @@ USEFUL_LABELS = {
 
 
 class DetectionVerifier:
-    """Reject weak color/shape candidates, then require repeated detections."""
+    """Confirm repeated detections; LAB checks are separately configurable."""
 
     def __init__(self, frame_width, frame_height):
         self.frame_width = frame_width
@@ -39,11 +39,22 @@ class DetectionVerifier:
         self._debug_latest = {}
         self._frame_diagnostics = []
 
+    def reset_task_history(self):
+        """Drop old confirmation evidence on FE; keep image/API capabilities."""
+        self._frame_index = 0
+        self._class_states.clear()
+        self._debug_start_us = 0
+        self._debug_checked = 0
+        self._debug_color_passed = 0
+        self._debug_confirmed = 0
+        self._debug_latest = {}
+        self._frame_diagnostics = []
+
     def process(self, img, objects, labels, debug_enabled=False):
         """Return only current-frame objects that pass all confirmation stages."""
         self._frame_diagnostics = []
         if not config.VERIFY_ENABLED:
-            if config.VISION_DIAGNOSTICS_ENABLED:
+            if config.VISION_DIAGNOSTICS_ENABLED and config.VISION_DIAGNOSTICS_VERBOSE:
                 self._frame_diagnostics = [
                     {"obj": obj, "status": "verification_disabled"} for obj in objects
                 ]
@@ -52,7 +63,7 @@ class DetectionVerifier:
         self._frame_index += 1
         candidates = self._select_candidates(objects, labels)
         diagnostic_records = {}
-        if config.VISION_DIAGNOSTICS_ENABLED:
+        if config.VISION_DIAGNOSTICS_ENABLED and config.VISION_DIAGNOSTICS_VERBOSE:
             checked_ids = {id(obj) for obj, _ in candidates}
             for obj in objects:
                 class_id = int(obj.class_id)
@@ -111,9 +122,10 @@ class DetectionVerifier:
                 metrics["evidence"] = evidence_hits
                 self._debug_latest[label] = metrics
                 # Class history only proves that this class is stable. Each
-                # individual box must still have current color/high-confidence
-                # evidence; otherwise one good green box would approve every
-                # false green candidate in the same frame.
+                # individual box must still have current evidence. With LAB
+                # disabled, valid box geometry is sufficient after main's
+                # per-class confidence gate; with LAB enabled, keep the former
+                # color/high-confidence evidence checks for each box.
                 if state["confirmed"] and current_evidence:
                     confirmed_objects.append(obj)
                     self._debug_confirmed += 1
@@ -188,6 +200,25 @@ class DetectionVerifier:
             <= config.VERIFY_SQUARE_ASPECT_MAX
         ):
             metrics["reason"] = "aspect_rejected"
+            return False, metrics
+
+        if not getattr(config, "VERIFY_COLOR_ENABLED", False):
+            # Do not call find_blobs or other pixel operations, even in DEBUG
+            # or verbose mode. Keep class history, current-frame-only outputs,
+            # candidate caps and the existing inexpensive geometry checks.
+            metrics["ok"] = True
+            metrics["reason"] = "lab_disabled_yolo_evidence"
+            return True, metrics
+
+        if (
+            getattr(config, "VERIFY_SKIP_REDUNDANT_COLOR_ON_HIGH_CONFIDENCE", True)
+            and not config.VISION_DIAGNOSTICS_VERBOSE
+            and float(getattr(obj, "score", 0.0)) >= config.VERIFY_HIGH_CONFIDENCE_BYPASS
+        ):
+            # process() already accepts this score as per-box evidence even
+            # when color fails. Keep that same decision/temporal history,
+            # without scanning pixels whose result cannot change it.
+            metrics["reason"] = "high_confidence_evidence"
             return False, metrics
 
         if not self._color_available:
@@ -355,7 +386,7 @@ class DetectionVerifier:
             del self._class_states[label]
 
     def _report_debug(self, enabled):
-        if not enabled:
+        if not enabled or not config.VISION_DIAGNOSTICS_VERBOSE:
             self._debug_start_us = 0
             self._reset_debug_counts()
             return
@@ -383,7 +414,8 @@ class DetectionVerifier:
                 )
             )
         print(
-            "[VERIFY] checked={} color_pass={} confirmed={} active_classes={}{}".format(
+            "[VERIFY] lab={} checked={} evidence_pass={} confirmed={} active_classes={}{}".format(
+                "on" if getattr(config, "VERIFY_COLOR_ENABLED", False) else "off",
                 self._debug_checked,
                 self._debug_color_passed,
                 self._debug_confirmed,

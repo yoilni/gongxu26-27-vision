@@ -6,8 +6,8 @@ import app_config as config
 def zone_obstacle_polygon(roi_rect, frame_width, frame_height):
     """Return top-left/right, bottom-right/left vertices, or None.
 
-    The narrow front edge is symmetric about the image center. The wide
-    rear edge retains the ROI width and the configured inward offset.
+    Build the original centered front edge and ROI-relative rear edge,
+    then clip its top at the configured Y, preserving both sloped sides.
     """
     if roi_rect is None or frame_width <= 0 or frame_height <= 0:
         return None
@@ -27,6 +27,13 @@ def zone_obstacle_polygon(roi_rect, frame_width, frame_height):
     )
     if front_left >= front_right or rear_left >= rear_right or front_y >= rear_y:
         return None
+    clipped_y = max(front_y, float(config.UART_ZONE_OBSTACLE_CLIP_TOP_Y))
+    if clipped_y >= rear_y:
+        return None
+    progress = (clipped_y - front_y) / (rear_y - front_y)
+    front_left += progress * (rear_left - front_left)
+    front_right += progress * (rear_right - front_right)
+    front_y = clipped_y
     return (
         (front_left, front_y), (front_right, front_y),
         (rear_right, rear_y), (rear_left, rear_y),

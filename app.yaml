@@ -1,6 +1,6 @@
-id: r2
-name: gongxunV930
-version: 1.0.9
+id: progx
+name: gongxunVpro
+version: 1.2.3
 author: '1'
 icon: ''
 desc: '1'
@@ -10,17 +10,45 @@ files:
   - app.yaml
   - code_scanner.py
   - coordinate_sender.py
+  - dataset_capture.py
+  - debug_lab_preview.py
   - debug_target_preview.py
+  - debug_zone_black.py
+  - detection_confidence.py
   - detection_verifier.py
   - DIAGNOSTICS.md
   - main.py
+  - mcu_post14_e4.patch
   - media_control.py
   - menu_ui.py
+  - model_class_mapping.py
   - performance_debug.py
   - serial_controller.py
   - target_selector.py
+  - test_claw_geometry.py
+  - test_dataset_capture.py
+  - test_debug_fps.py
+  - test_debug_lab_preview.py
+  - test_debug_zone_black.py
+  - test_detection_confidence.py
+  - test_first_green_overlap.py
+  - test_micro_adjust.py
+  - test_model_class_mapping.py
   - test_qrcode.png
+  - test_red_roi_capture.py
+  - test_red_switch_handshake.py
+  - test_search_roi_exclusion.py
+  - test_spacing_y_bands.py
+  - test_startzone_escape.py
+  - test_supply_collect.py
+  - test_target_acquisition_guard.py
+  - test_task_reset.py
+  - test_tracking_roi.py
   - test_vision_rules.py
+  - test_zone_area_gate.py
+  - test_zone_realign.py
+  - tracking_roi.py
   - vision_diagnostics.py
   - vision_overlay.py
+  - zone_blackbar.py
   - zone_obstacle_region.py
